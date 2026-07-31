@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import bcrypt from "bcryptjs";
+import { verify as argon2Verify } from "@node-rs/argon2";
 import { getDb, generateToken } from "../db";
 import { authenticate } from "../middleware/auth";
 
@@ -12,6 +13,24 @@ const registerSchema = z.object({
   password: z.string().min(6),
 });
 const loginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
+
+/**
+ * Verify a password against a stored hash, supporting both bcrypt and
+ * legacy argon2id hashes (created by Bun's `Bun.password.hash` default).
+ * Returns true if the password matches; on a successful argon2 match the
+ * hash is re-hashed to bcrypt so the account migrates automatically.
+ */
+async function verifyPassword(db: ReturnType<typeof getDb>, password: string, storedHash: string, userId: number): Promise<boolean> {
+  if (storedHash.startsWith("$argon2")) {
+    const ok = await argon2Verify(storedHash, password);
+    if (ok) {
+      const newHash = await bcrypt.hash(password, 10);
+      db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run([newHash, userId]);
+    }
+    return ok;
+  }
+  return bcrypt.compare(password, storedHash);
+}
 
 router.post("/register", async (c) => {
   try {
@@ -38,7 +57,7 @@ router.post("/login", async (c) => {
     const db = getDb();
     const user = db.prepare("SELECT id, name, email, password_hash FROM users WHERE email = ?").get(data.email.toLowerCase().trim()) as { id: number; name: string | null; email: string; password_hash: string } | undefined;
     if (!user) return c.json({ error: "Invalid email or password" }, 401);
-    const valid = await bcrypt.compare(data.password, user.password_hash);
+    const valid = await verifyPassword(db, data.password, user.password_hash, user.id);
     if (!valid) return c.json({ error: "Invalid email or password" }, 401);
     const token = generateToken();
     db.prepare("INSERT INTO sessions (id, user_id) VALUES (?, ?)").run([token, user.id]);
