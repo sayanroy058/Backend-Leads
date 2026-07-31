@@ -1,11 +1,12 @@
-import { Database } from "bun:sqlite";
+import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const DB_DIR = join(import.meta.dir, "..", "data");
+const DB_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "data");
 const DB_PATH = join(DB_DIR, "leadflow.db");
 
-let db: Database;
+let db: Database.Database;
 
 function ensureDir() {
   if (!existsSync(DB_DIR)) {
@@ -13,11 +14,11 @@ function ensureDir() {
   }
 }
 
-function initDb(database: Database) {
-  database.run("PRAGMA journal_mode=WAL");
-  database.run("PRAGMA foreign_keys=ON");
+function initDb(database: Database.Database) {
+  database.pragma("journal_mode = WAL");
+  database.pragma("foreign_keys = ON");
 
-  database.run(`
+  database.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT,
@@ -26,7 +27,7 @@ function initDb(database: Database) {
       created_at TEXT DEFAULT (datetime('now'))
     )`);
 
-  database.run(`
+  database.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       user_id INTEGER NOT NULL,
@@ -34,7 +35,7 @@ function initDb(database: Database) {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )`);
 
-  database.run(`
+  database.exec(`
     CREATE TABLE IF NOT EXISTS leads (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -51,7 +52,7 @@ function initDb(database: Database) {
       created_at TEXT DEFAULT (datetime('now'))
     )`);
 
-  database.run(`
+  database.exec(`
     CREATE TABLE IF NOT EXISTS email_messages (
       id TEXT PRIMARY KEY,
       lead_id TEXT,
@@ -67,7 +68,7 @@ function initDb(database: Database) {
       FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
     )`);
 
-  database.run(`
+  database.exec(`
     CREATE TABLE IF NOT EXISTS whatsapp_messages (
       id TEXT PRIMARY KEY,
       lead_id TEXT,
@@ -80,7 +81,7 @@ function initDb(database: Database) {
       FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
     )`);
 
-  database.run(`
+  database.exec(`
     CREATE TABLE IF NOT EXISTS call_logs (
       id TEXT PRIMARY KEY,
       lead_id TEXT,
@@ -97,7 +98,7 @@ function initDb(database: Database) {
       FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
     )`);
 
-  database.run(`
+  database.exec(`
     CREATE TABLE IF NOT EXISTS appointments (
       id TEXT PRIMARY KEY,
       lead_id TEXT,
@@ -110,7 +111,7 @@ function initDb(database: Database) {
       FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
     )`);
 
-  database.run(`
+  database.exec(`
     CREATE TABLE IF NOT EXISTS chat_messages (
       id TEXT PRIMARY KEY,
       role TEXT NOT NULL CHECK(role IN ('user','assistant')),
@@ -120,7 +121,7 @@ function initDb(database: Database) {
     )`);
 }
 
-export function getDb(): Database {
+export function getDb(): Database.Database {
   if (!db) {
     ensureDir();
     db = new Database(DB_PATH);

@@ -8,7 +8,7 @@ const router = new Hono();
 router.get("/", (c) => {
   const user = authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
-  const rows = getDb().query("SELECT * FROM leads ORDER BY created_at DESC").all();
+  const rows = getDb().prepare("SELECT * FROM leads ORDER BY created_at DESC").all();
   return c.json(rows);
 });
 
@@ -47,7 +47,7 @@ router.post("/status", async (c) => {
   const user = authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const { id, status } = z.object({ id: z.string(), status: z.enum(["new", "contacted", "qualified", "booked", "lost"]) }).parse(await c.req.json());
-  getDb().run("UPDATE leads SET status = ?, last_activity = ? WHERE id = ?", [status, new Date().toISOString(), id]);
+  getDb().prepare("UPDATE leads SET status = ?, last_activity = ? WHERE id = ?").run([status, new Date().toISOString(), id]);
   return c.json({ success: true });
 });
 
@@ -56,10 +56,10 @@ router.get("/activity/counts", (c) => {
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const db = getDb();
   return c.json({
-    emails: (db.query("SELECT COUNT(*) as c FROM email_messages").get() as { c: number }).c,
-    whatsapps: (db.query("SELECT COUNT(*) as c FROM whatsapp_messages").get() as { c: number }).c,
-    calls: (db.query("SELECT COUNT(*) as c FROM call_logs").get() as { c: number }).c,
-    appts: (db.query("SELECT COUNT(*) as c FROM appointments").get() as { c: number }).c,
+    emails: (db.prepare("SELECT COUNT(*) as c FROM email_messages").get() as { c: number }).c,
+    whatsapps: (db.prepare("SELECT COUNT(*) as c FROM whatsapp_messages").get() as { c: number }).c,
+    calls: (db.prepare("SELECT COUNT(*) as c FROM call_logs").get() as { c: number }).c,
+    appts: (db.prepare("SELECT COUNT(*) as c FROM appointments").get() as { c: number }).c,
   });
 });
 
@@ -67,9 +67,9 @@ router.get("/activity/feed", (c) => {
   const user = authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const db = getDb();
-  const emails = db.query("SELECT id, subject, status, created_at FROM email_messages ORDER BY created_at DESC LIMIT 20").all() as { id: string; subject: string; status: string; created_at: string }[];
-  const was = db.query("SELECT id, status, created_at FROM whatsapp_messages ORDER BY created_at DESC LIMIT 20").all() as { id: string; status: string; created_at: string }[];
-  const calls = db.query("SELECT id, status, outcome, created_at FROM call_logs ORDER BY created_at DESC LIMIT 20").all() as { id: string; status: string; outcome: string | null; created_at: string }[];
+  const emails = db.prepare("SELECT id, subject, status, created_at FROM email_messages ORDER BY created_at DESC LIMIT 20").all() as { id: string; subject: string; status: string; created_at: string }[];
+  const was = db.prepare("SELECT id, status, created_at FROM whatsapp_messages ORDER BY created_at DESC LIMIT 20").all() as { id: string; status: string; created_at: string }[];
+  const calls = db.prepare("SELECT id, status, outcome, created_at FROM call_logs ORDER BY created_at DESC LIMIT 20").all() as { id: string; status: string; outcome: string | null; created_at: string }[];
   const items = [
     ...emails.map((e) => ({ id: `e-${e.id}`, type: "email", text: `Email "${e.subject}" — ${e.status}`, when: e.created_at })),
     ...was.map((e) => ({ id: `w-${e.id}`, type: "whatsapp", text: `WhatsApp message — ${e.status}`, when: e.created_at })),

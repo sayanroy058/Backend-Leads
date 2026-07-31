@@ -9,21 +9,21 @@ const auth = (c: any) => { const u = authenticate(c); if (!u) { c.status(401); r
 // ---- Chat ----
 router.get("/chat", (c) => {
   if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
-  return c.json(getDb().query("SELECT * FROM chat_messages ORDER BY created_at ASC LIMIT 50").all());
+  return c.json(getDb().prepare("SELECT * FROM chat_messages ORDER BY created_at ASC LIMIT 50").all());
 });
 
 router.post("/chat", async (c) => {
   if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
   const { role, content, citations } = z.object({ role: z.enum(["user", "assistant"]), content: z.string(), citations: z.array(z.string()).optional() }).parse(await c.req.json());
   const id = crypto.randomUUID();
-  getDb().run("INSERT INTO chat_messages (id, role, content, citations) VALUES (?, ?, ?, ?)", [id, role, content, citations ? JSON.stringify(citations) : null]);
+  getDb().prepare("INSERT INTO chat_messages (id, role, content, citations) VALUES (?, ?, ?, ?)").run([id, role, content, citations ? JSON.stringify(citations) : null]);
   return c.json({ id });
 });
 
 // ---- Email ----
 router.get("/emails", (c) => {
   if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
-  return c.json(getDb().query("SELECT * FROM email_messages ORDER BY created_at DESC LIMIT 100").all());
+  return c.json(getDb().prepare("SELECT * FROM email_messages ORDER BY created_at DESC LIMIT 100").all());
 });
 
 router.post("/emails", async (c) => {
@@ -44,14 +44,14 @@ router.post("/emails/status", async (c) => {
   if (d.delivered_at) { sets.push("delivered_at = ?"); vals.push(d.delivered_at); }
   if (d.opened_at) { sets.push("opened_at = ?"); vals.push(d.opened_at); }
   vals.push(d.id);
-  db.run(`UPDATE email_messages SET ${sets.join(", ")} WHERE id = ?`, vals);
+  db.prepare(`UPDATE email_messages SET ${sets.join(", ")} WHERE id = ?`).run(vals);
   return c.json({ success: true });
 });
 
 // ---- WhatsApp ----
 router.get("/whatsapps", (c) => {
   if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
-  return c.json(getDb().query("SELECT * FROM whatsapp_messages ORDER BY created_at DESC LIMIT 100").all());
+  return c.json(getDb().prepare("SELECT * FROM whatsapp_messages ORDER BY created_at DESC LIMIT 100").all());
 });
 
 router.post("/whatsapps", async (c) => {
@@ -72,14 +72,14 @@ router.post("/whatsapps/status", async (c) => {
   if (d.delivered_at) { sets.push("delivered_at = ?"); vals.push(d.delivered_at); }
   if (d.read_at) { sets.push("read_at = ?"); vals.push(d.read_at); }
   vals.push(d.id);
-  db.run(`UPDATE whatsapp_messages SET ${sets.join(", ")} WHERE id = ?`, vals);
+  db.prepare(`UPDATE whatsapp_messages SET ${sets.join(", ")} WHERE id = ?`).run(vals);
   return c.json({ success: true });
 });
 
 // ---- Calls ----
 router.get("/calls", (c) => {
   if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
-  return c.json(getDb().query("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 50").all());
+  return c.json(getDb().prepare("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 50").all());
 });
 
 router.post("/calls", async (c) => {
@@ -88,7 +88,7 @@ router.post("/calls", async (c) => {
   const db = getDb();
   const stmt = db.prepare("INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)");
   db.transaction((rows: typeof data) => { for (const r of rows) stmt.run(crypto.randomUUID(), r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"); })(data);
-  return c.json(db.query("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 50").all());
+  return c.json(db.prepare("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 50").all());
 });
 
 router.post("/calls/status", async (c) => {
@@ -105,20 +105,20 @@ router.post("/calls/status", async (c) => {
   if (d.ended_at !== undefined) { sets.push("ended_at = ?"); vals.push(d.ended_at); }
   if (!sets.length) return c.json({ success: true });
   vals.push(d.id);
-  db.run(`UPDATE call_logs SET ${sets.join(", ")} WHERE id = ?`, vals);
+  db.prepare(`UPDATE call_logs SET ${sets.join(", ")} WHERE id = ?`).run(vals);
   return c.json({ success: true });
 });
 
 // ---- Appointments ----
 router.get("/appointments", (c) => {
   if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
-  return c.json(getDb().query("SELECT id, title, scheduled_at, lead_id FROM appointments ORDER BY scheduled_at ASC LIMIT 20").all());
+  return c.json(getDb().prepare("SELECT id, title, scheduled_at, lead_id FROM appointments ORDER BY scheduled_at ASC LIMIT 20").all());
 });
 
 router.post("/appointments", async (c) => {
   if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
   const d = z.object({ lead_id: z.string(), call_id: z.string().optional(), title: z.string(), scheduled_at: z.string(), duration_min: z.number().optional(), status: z.string().optional() }).parse(await c.req.json());
-  getDb().run("INSERT INTO appointments (id, lead_id, call_id, title, scheduled_at, duration_min, status) VALUES (?, ?, ?, ?, ?, ?, ?)", [crypto.randomUUID(), d.lead_id, d.call_id ?? null, d.title, d.scheduled_at, d.duration_min ?? 30, d.status ?? "confirmed"]);
+  getDb().prepare("INSERT INTO appointments (id, lead_id, call_id, title, scheduled_at, duration_min, status) VALUES (?, ?, ?, ?, ?, ?, ?)").run([crypto.randomUUID(), d.lead_id, d.call_id ?? null, d.title, d.scheduled_at, d.duration_min ?? 30, d.status ?? "confirmed"]);
   return c.json({ success: true });
 });
 
