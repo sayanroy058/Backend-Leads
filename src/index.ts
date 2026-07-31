@@ -1,3 +1,4 @@
+import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import authRoutes from "./routes/auth";
@@ -26,4 +27,4 @@ app.get("/api/health", (c) => c.json({ status: "ok" }));
 const port = parseInt(process.env.PORT ?? "3001");
 
 console.log(`Backend running on http://localhost:${port}`);
-export default { port, fetch: app.fetch };
+serve({ fetch: app.fetch, port });
