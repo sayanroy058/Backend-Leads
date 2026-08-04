@@ -22,7 +22,7 @@ function leadsBlock(leads: LeadCtx[]) {
 type LeadCtx = { id: string; name: string; company: string | null; email: string | null; city: string | null; status: string; score: number; value: number | null; source: string | null; notes: string | null };
 
 router.post("/chat", async (c) => {
-  if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const { question, leads } = z.object({ question: z.string(), leads: z.array(z.any()) }).parse(await c.req.json());
   const ai = gateway();
   const { text } = await generateText({
@@ -36,7 +36,7 @@ router.post("/chat", async (c) => {
 });
 
 router.post("/email", async (c) => {
-  if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const { lead, tone, goal, senderName } = z.object({ lead: z.any(), tone: z.string(), goal: z.string(), senderName: z.string().optional() }).parse(await c.req.json());
   const ai = gateway();
   const { text } = await generateText({
@@ -46,7 +46,7 @@ router.post("/email", async (c) => {
 });
 
 router.post("/whatsapp", async (c) => {
-  if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const { lead, intent } = z.object({ lead: z.any(), intent: z.string() }).parse(await c.req.json());
   const ai = gateway();
   const { text } = await generateText({
@@ -56,7 +56,7 @@ router.post("/whatsapp", async (c) => {
 });
 
 router.post("/call", async (c) => {
-  if (!authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const { lead, goal } = z.object({ lead: z.any(), goal: z.string() }).parse(await c.req.json());
   const ai = gateway();
   const { text } = await generateText({
