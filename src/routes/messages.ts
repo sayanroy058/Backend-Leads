@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import type { InStatement } from "@libsql/client";
 import { getDb } from "../db";
 import { authenticate } from "../middleware/auth";
 
@@ -34,12 +35,11 @@ router.post("/emails", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const data = z.array(z.object({ lead_id: z.string(), subject: z.string(), body: z.string(), tone: z.string().optional(), goal: z.string().optional(), status: z.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  for (const r of data) {
-    await db.execute({
-      sql: "INSERT INTO email_messages (id, lead_id, subject, body, tone, goal, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      args: [crypto.randomUUID(), r.lead_id, r.subject, r.body, r.tone ?? null, r.goal ?? null, r.status ?? "draft"],
-    });
-  }
+  const statements: InStatement[] = data.map((r) => ({
+    sql: "INSERT INTO email_messages (id, lead_id, subject, body, tone, goal, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    args: [crypto.randomUUID(), r.lead_id, r.subject, r.body, r.tone ?? null, r.goal ?? null, r.status ?? "draft"],
+  }));
+  if (statements.length) await db.batch(statements, "write"); // atomic insert
   return c.json({ success: true });
 });
 
@@ -67,12 +67,11 @@ router.post("/whatsapps", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const data = z.array(z.object({ lead_id: z.string(), body: z.string(), status: z.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  for (const r of data) {
-    await db.execute({
-      sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)",
-      args: [crypto.randomUUID(), r.lead_id, r.body, r.status ?? "draft"],
-    });
-  }
+  const statements: InStatement[] = data.map((r) => ({
+    sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)",
+    args: [crypto.randomUUID(), r.lead_id, r.body, r.status ?? "draft"],
+  }));
+  if (statements.length) await db.batch(statements, "write"); // atomic insert
   return c.json({ success: true });
 });
 
@@ -100,12 +99,11 @@ router.post("/calls", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const data = z.array(z.object({ lead_id: z.string(), goal: z.string().optional(), voice: z.string().optional(), status: z.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  for (const r of data) {
-    await db.execute({
-      sql: "INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)",
-      args: [crypto.randomUUID(), r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"],
-    });
-  }
+  const statements: InStatement[] = data.map((r) => ({
+    sql: "INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)",
+    args: [crypto.randomUUID(), r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"],
+  }));
+  if (statements.length) await db.batch(statements, "write"); // atomic insert
   const rows = (await db.execute("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 50")).rows;
   return c.json(rows);
 });

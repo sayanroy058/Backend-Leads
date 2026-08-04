@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import type { InStatement } from "@libsql/client";
 import { getDb } from "../db";
 import { authenticate } from "../middleware/auth";
 
@@ -31,15 +32,17 @@ router.post("/bulk", async (c) => {
   const data = z.array(leadSchema).parse(await c.req.json());
   const db = await getDb();
   const inserted: Record<string, unknown>[] = [];
+  const statements: InStatement[] = [];
   for (const r of data) {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
-    await db.execute({
+    statements.push({
       sql: "INSERT OR REPLACE INTO leads (id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       args: [id, r.name, r.email ?? null, r.phone ?? null, r.company ?? null, r.source ?? "import", r.status ?? "new", r.score ?? 50, r.value ?? null, r.city ?? null, r.notes ?? null, now, now],
     });
     inserted.push({ ...r, id, status: r.status ?? "new", score: r.score ?? 50, last_activity: now, created_at: now });
   }
+  if (statements.length) await db.batch(statements, "write"); // atomic import
   return c.json(inserted);
 });
 

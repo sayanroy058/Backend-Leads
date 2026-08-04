@@ -116,13 +116,19 @@ const TABLE_DDL = [
 const DEMO_USER_HASH = "$2b$10$/ixfDGIckZ5KISPFS5y7puGhS4MGJkUJHkrdgDMG.si2aBQtWHy2u";
 
 async function initDb(c: Client) {
-  for (const stmt of TABLE_DDL) {
-    await c.execute(stmt);
-  }
-  await c.execute({
-    sql: "INSERT OR IGNORE INTO users (name, email, password_hash) VALUES (?, ?, ?)",
-    args: ["Test User", "testuser@gmail.com", DEMO_USER_HASH],
-  });
+  // Single round-trip: all DDL + demo-user seed run atomically on cold start.
+  // Explicit id=1 for the demo user avoids AUTOINCREMENT sequence drift from
+  // repeated INSERT OR IGNORE on every cold start.
+  await c.batch(
+    [
+      ...TABLE_DDL,
+      {
+        sql: "INSERT OR IGNORE INTO users (id, name, email, password_hash) VALUES (1, ?, ?, ?)",
+        args: ["Test User", "testuser@gmail.com", DEMO_USER_HASH],
+      },
+    ],
+    "write"
+  );
 }
 
 /**
