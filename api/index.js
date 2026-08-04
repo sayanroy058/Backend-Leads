@@ -574,31 +574,19 @@ async function toWebRequest(req) {
   }
   return new Request(url, { method: req.method ?? "GET", headers, body });
 }
-function sendNodeResponse(res, response) {
+async function sendNodeResponse(res, response) {
   res.statusCode = response.status;
   for (const [key, value] of response.headers.entries()) res.setHeader(key, value);
-  response.arrayBuffer().then((buf) => res.end(Buffer.from(buf))).catch((e) => {
-    res.statusCode = 500;
-    res.end(JSON.stringify({ error: e.message }));
-  });
+  res.end(Buffer.from(await response.arrayBuffer()));
 }
 async function handler(req, res) {
   try {
     const response = await index_default.fetch(await toWebRequest(req));
-    if (res) {
-      sendNodeResponse(res, response);
-    } else {
-      return response;
-    }
+    await sendNodeResponse(res, response);
   } catch (e) {
-    const body = JSON.stringify({ error: e.message });
-    if (res) {
-      res.statusCode = 500;
-      res.setHeader("Content-Type", "application/json");
-      res.end(body);
-    } else {
-      return new Response(body, { status: 500, headers: { "Content-Type": "application/json" } });
-    }
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ error: e.message }));
   }
 }
 export {
