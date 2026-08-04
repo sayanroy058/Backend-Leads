@@ -1,6 +1,3 @@
-// src/vercel.ts
-import { handle } from "hono/vercel";
-
 // src/index.ts
 import { serve } from "@hono/node-server";
 import { Hono as Hono5 } from "hono";
@@ -553,7 +550,57 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 // src/vercel.ts
-var vercel_default = handle(index_default);
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => resolve(chunks.length ? Buffer.concat(chunks) : void 0));
+    req.on("error", reject);
+  });
+}
+async function toWebRequest(req) {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value === void 0) continue;
+    if (Array.isArray(value)) for (const v of value) headers.append(key, v);
+    else headers.set(key, value);
+  }
+  headers.delete("content-length");
+  headers.delete("transfer-encoding");
+  let body;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    body = await readBody(req);
+  }
+  return new Request(url, { method: req.method ?? "GET", headers, body });
+}
+function sendNodeResponse(res, response) {
+  res.statusCode = response.status;
+  for (const [key, value] of response.headers.entries()) res.setHeader(key, value);
+  response.arrayBuffer().then((buf) => res.end(Buffer.from(buf))).catch((e) => {
+    res.statusCode = 500;
+    res.end(JSON.stringify({ error: e.message }));
+  });
+}
+async function handler(req, res) {
+  try {
+    const response = await index_default.fetch(await toWebRequest(req));
+    if (res) {
+      sendNodeResponse(res, response);
+    } else {
+      return response;
+    }
+  } catch (e) {
+    const body = JSON.stringify({ error: e.message });
+    if (res) {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      res.end(body);
+    } else {
+      return new Response(body, { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+  }
+}
 export {
-  vercel_default as default
+  handler as default
 };
