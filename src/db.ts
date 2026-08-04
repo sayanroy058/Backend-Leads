@@ -126,6 +126,19 @@ function initDb(database: Database.Database) {
       citations TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     )`);
+
+  seedDemoUser(database);
+}
+
+// Hardcoded demo account so login works out of the box.
+//   email:    testuser@gmail.com
+//   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
+// INSERT OR IGNORE keeps the seed idempotent across restarts/cold starts.
+function seedDemoUser(database: Database.Database) {
+  const hash = "$2b$10$/ixfDGIckZ5KISPFS5y7puGhS4MGJkUJHkrdgDMG.si2aBQtWHy2u";
+  database
+    .prepare("INSERT OR IGNORE INTO users (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Test User", "testuser@gmail.com", hash);
 }
 
 export function getDb(): Database.Database {
