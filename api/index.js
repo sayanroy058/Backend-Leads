@@ -116,13 +116,16 @@ var TABLE_DDL = [
 ];
 var DEMO_USER_HASH = "$2b$10$/ixfDGIckZ5KISPFS5y7puGhS4MGJkUJHkrdgDMG.si2aBQtWHy2u";
 async function initDb(c) {
-  for (const stmt of TABLE_DDL) {
-    await c.execute(stmt);
-  }
-  await c.execute({
-    sql: "INSERT OR IGNORE INTO users (name, email, password_hash) VALUES (?, ?, ?)",
-    args: ["Test User", "testuser@gmail.com", DEMO_USER_HASH]
-  });
+  await c.batch(
+    [
+      ...TABLE_DDL,
+      {
+        sql: "INSERT OR IGNORE INTO users (id, name, email, password_hash) VALUES (1, ?, ?, ?)",
+        args: ["Test User", "testuser@gmail.com", DEMO_USER_HASH]
+      }
+    ],
+    "write"
+  );
 }
 async function getDb() {
   const c = getClient();
@@ -259,15 +262,17 @@ router2.post("/bulk", async (c) => {
   const data = z2.array(leadSchema).parse(await c.req.json());
   const db = await getDb();
   const inserted = [];
+  const statements = [];
   for (const r of data) {
     const id = crypto.randomUUID();
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    await db.execute({
+    statements.push({
       sql: "INSERT OR REPLACE INTO leads (id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       args: [id, r.name, r.email ?? null, r.phone ?? null, r.company ?? null, r.source ?? "import", r.status ?? "new", r.score ?? 50, r.value ?? null, r.city ?? null, r.notes ?? null, now, now]
     });
     inserted.push({ ...r, id, status: r.status ?? "new", score: r.score ?? 50, last_activity: now, created_at: now });
   }
+  if (statements.length) await db.batch(statements, "write");
   return c.json(inserted);
 });
 router2.post("/status", async (c) => {
@@ -335,12 +340,11 @@ router3.post("/emails", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
   const data = z3.array(z3.object({ lead_id: z3.string(), subject: z3.string(), body: z3.string(), tone: z3.string().optional(), goal: z3.string().optional(), status: z3.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  for (const r of data) {
-    await db.execute({
-      sql: "INSERT INTO email_messages (id, lead_id, subject, body, tone, goal, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      args: [crypto.randomUUID(), r.lead_id, r.subject, r.body, r.tone ?? null, r.goal ?? null, r.status ?? "draft"]
-    });
-  }
+  const statements = data.map((r) => ({
+    sql: "INSERT INTO email_messages (id, lead_id, subject, body, tone, goal, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    args: [crypto.randomUUID(), r.lead_id, r.subject, r.body, r.tone ?? null, r.goal ?? null, r.status ?? "draft"]
+  }));
+  if (statements.length) await db.batch(statements, "write");
   return c.json({ success: true });
 });
 router3.post("/emails/status", async (c) => {
@@ -374,12 +378,11 @@ router3.post("/whatsapps", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
   const data = z3.array(z3.object({ lead_id: z3.string(), body: z3.string(), status: z3.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  for (const r of data) {
-    await db.execute({
-      sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)",
-      args: [crypto.randomUUID(), r.lead_id, r.body, r.status ?? "draft"]
-    });
-  }
+  const statements = data.map((r) => ({
+    sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)",
+    args: [crypto.randomUUID(), r.lead_id, r.body, r.status ?? "draft"]
+  }));
+  if (statements.length) await db.batch(statements, "write");
   return c.json({ success: true });
 });
 router3.post("/whatsapps/status", async (c) => {
@@ -413,12 +416,11 @@ router3.post("/calls", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
   const data = z3.array(z3.object({ lead_id: z3.string(), goal: z3.string().optional(), voice: z3.string().optional(), status: z3.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  for (const r of data) {
-    await db.execute({
-      sql: "INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)",
-      args: [crypto.randomUUID(), r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"]
-    });
-  }
+  const statements = data.map((r) => ({
+    sql: "INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)",
+    args: [crypto.randomUUID(), r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"]
+  }));
+  if (statements.length) await db.batch(statements, "write");
   const rows = (await db.execute("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 50")).rows;
   return c.json(rows);
 });
