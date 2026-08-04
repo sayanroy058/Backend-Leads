@@ -1,5 +1,4 @@
 node_modules/
 dist/
-api/index.js
 data/*.db*
 .env
