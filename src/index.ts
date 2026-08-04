@@ -6,6 +6,11 @@ import leadsRoutes from "./routes/leads";
 import messagesRoutes from "./routes/messages";
 import aiRoutes from "./routes/ai";
 
+const extraOrigins = (process.env.CORS_ORIGINS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 const app = new Hono();
 
 app.use("/*", cors({
@@ -13,6 +18,7 @@ app.use("/*", cors({
     "http://localhost:5173",
     "http://localhost:3000",
     "https://rosybrown-pig-742740.hostingersite.com",
+    ...extraOrigins,
   ],
   credentials: true,
 }));
@@ -24,7 +30,14 @@ app.route("/api/ai", aiRoutes);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 
-const port = parseInt(process.env.PORT ?? "3001");
+export default app;
 
-console.log(`Backend running on http://localhost:${port}`);
-serve({ fetch: app.fetch, port });
+// Local dev only. On Vercel the app is served as a serverless function via
+// api/index.ts (see vercel.json), so no listener may be started here.
+if (process.env.NODE_ENV !== "production") {
+  const port = parseInt(process.env.PORT ?? "3001");
+  console.log(`Backend running on http://localhost:${port}`);
+  serve({ fetch: app.fetch, port });
+} else {
+  console.log("Leadflow backend in serverless mode — no listener started.");
+}

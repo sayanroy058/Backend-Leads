@@ -4,13 +4,20 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DB_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "data");
-const DB_PATH = process.env.DB_PATH ?? join(DB_DIR, "leadflow.db");
+// Vercel serverless functions have a read-only filesystem except /tmp, so
+// default to /tmp there. NOTE: /tmp is ephemeral — data does not persist
+// across cold starts. Point DB_PATH at a hosted DB (e.g. Turso/Neon) for
+// real persistence on serverless.
+const DB_PATH =
+  process.env.DB_PATH ??
+  (process.env.VERCEL ? "/tmp/leadflow.db" : join(DB_DIR, "leadflow.db"));
 
 let db: Database.Database;
 
 function ensureDir() {
-  if (!existsSync(DB_DIR)) {
-    mkdirSync(DB_DIR, { recursive: true });
+  const dir = dirname(DB_PATH);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
   }
 }
 
