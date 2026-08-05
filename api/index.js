@@ -256,6 +256,18 @@ var leadSchema = z2.object({
   city: z2.string().nullable().optional(),
   notes: z2.string().nullable().optional()
 });
+var updateLeadSchema = z2.object({
+  name: z2.string().optional(),
+  email: z2.string().nullable().optional(),
+  phone: z2.string().nullable().optional(),
+  company: z2.string().nullable().optional(),
+  source: z2.string().nullable().optional(),
+  status: z2.enum(["new", "contacted", "qualified", "booked", "lost"]).optional(),
+  score: z2.number().optional(),
+  value: z2.number().nullable().optional(),
+  city: z2.string().nullable().optional(),
+  notes: z2.string().nullable().optional()
+});
 router2.post("/bulk", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
@@ -309,6 +321,37 @@ router2.get("/activity/feed", async (c) => {
     ...calls.map((e) => ({ id: `c-${e.id}`, type: "call", text: `Call \u2014 ${e.status}${e.outcome ? ` \xB7 ${e.outcome}` : ""}`, when: e.created_at }))
   ].sort((a, b) => +new Date(b.when) - +new Date(a.when)).slice(0, 8);
   return c.json(items);
+});
+router2.get("/:id", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const row = (await (await getDb()).execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [c.req.param("id")] })).rows[0];
+  if (!row) return c.json({ error: "Lead not found" }, 404);
+  return c.json(row);
+});
+router2.put("/:id", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const id = c.req.param("id");
+  const data = updateLeadSchema.parse(await c.req.json());
+  const db = await getDb();
+  const sets = [];
+  const vals = [];
+  for (const [k, v] of Object.entries(data)) {
+    sets.push(`${k} = ?`);
+    vals.push(v);
+  }
+  sets.push("last_activity = ?");
+  vals.push((/* @__PURE__ */ new Date()).toISOString());
+  vals.push(id);
+  await db.execute({ sql: `UPDATE leads SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  const row = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0];
+  if (!row) return c.json({ error: "Lead not found" }, 404);
+  return c.json(row);
+});
+router2.delete("/:id", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const id = c.req.param("id");
+  await (await getDb()).execute({ sql: "DELETE FROM leads WHERE id = ?", args: [id] });
+  return c.json({ success: true });
 });
 var leads_default = router2;
 
@@ -485,7 +528,7 @@ import { z as z4 } from "zod";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText } from "ai";
 var router4 = new Hono4();
-var MODEL = process.env.AI_MODEL ?? "google/gemini-2.5-flash";
+var MODEL = process.env.AI_MODEL ?? "openai/gpt-5.6-luna";
 function gateway() {
   const apiKey = process.env.AI_API_KEY;
   const baseURL = process.env.AI_BASE_URL;
@@ -505,8 +548,7 @@ router4.post("/chat", async (c) => {
     prompt: `Leads (${leads.length}):
 ${leadsBlock(leads)}
 
-User question: ${question}`,
-    temperature: 0.3
+User question: ${question}`
   });
   const ids = Array.from(text.matchAll(/\[lead:([a-z0-9-]{8,})\]/gi)).map((m) => m[1]);
   const cited = Array.from(new Set(ids)).map((short) => leads.find((l) => l.id.startsWith(short))?.id).filter(Boolean);
@@ -521,8 +563,7 @@ router4.post("/email", async (c) => {
     system: `You write short, high-converting sales emails. Reply as strict JSON: {"subject":"...","body":"..."}. Keep body under 110 words. Sign as ${senderName ?? "Jordan"}.`,
     prompt: `Tone: ${tone}
 Goal: ${goal}
-Lead: ${JSON.stringify(lead)}`,
-    temperature: 0.7
+Lead: ${JSON.stringify(lead)}`
   });
   try {
     const j = JSON.parse(text.replace(/```json|```/g, "").trim());
@@ -539,8 +580,7 @@ router4.post("/whatsapp", async (c) => {
     model: ai(MODEL),
     system: "Write a friendly, concise WhatsApp follow-up (1-3 sentences, max 280 chars). Use the lead's first name. One emoji max. Return ONLY the message body.",
     prompt: `Intent: ${intent}
-Lead: ${JSON.stringify(lead)}`,
-    temperature: 0.7
+Lead: ${JSON.stringify(lead)}`
   });
   return c.json({ body: text.trim().replace(/^"|"$/g, "") });
 });
@@ -552,14 +592,36 @@ router4.post("/call", async (c) => {
     model: ai(MODEL),
     system: 'Design AI voice agent call flows. Return strict JSON: {"opening":"...","talking_points":["..."],"objection_handling":["..."],"closing":"...","mock_transcript":[{"speaker":"agent|lead","text":"..."}],"summary":"...","suggested_outcome":"booked|interested|callback|not_interested|voicemail","book_appointment":true|false}. Transcript should be 6-10 turns.',
     prompt: `Call goal: ${goal}
-Lead: ${JSON.stringify(lead)}`,
-    temperature: 0.6
+Lead: ${JSON.stringify(lead)}`
   });
   try {
     return c.json(JSON.parse(text.replace(/```json|```/g, "").trim()));
   } catch {
     return c.json({ suggested_outcome: "callback", book_appointment: false, summary: text, mock_transcript: [] });
   }
+});
+router4.post("/image", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const { prompt, size } = z4.object({ prompt: z4.string(), size: z4.string().optional() }).parse(await c.req.json());
+  const apiKey = process.env.AI_API_KEY;
+  const baseURL = process.env.AI_BASE_URL;
+  if (!apiKey || !baseURL) return c.json({ error: "Missing AI_API_KEY or AI_BASE_URL" }, 500);
+  const model = process.env.AI_IMAGE_MODEL ?? "gpt-image-2";
+  const endpoint = `${baseURL.replace(/\/+$/, "")}/images/generations`;
+  const upstream = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ model, prompt, n: 1, size: size ?? "auto" })
+  });
+  if (!upstream.ok) {
+    const detail = await upstream.text();
+    return c.json({ error: `Image generation failed (${upstream.status}): ${detail.slice(0, 500)}` }, 502);
+  }
+  const json = await upstream.json();
+  const item = json.data?.[0];
+  if (item?.b64_json) return c.json({ image: `data:image/png;base64,${item.b64_json}` });
+  if (item?.url) return c.json({ image: item.url });
+  return c.json({ error: "No image returned by the model" }, 502);
 });
 var ai_default = router4;
 

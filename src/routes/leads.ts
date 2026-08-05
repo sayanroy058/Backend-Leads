@@ -26,6 +26,19 @@ const leadSchema = z.object({
   notes: z.string().nullable().optional(),
 });
 
+const updateLeadSchema = z.object({
+  name: z.string().optional(),
+  email: z.string().nullable().optional(),
+  phone: z.string().nullable().optional(),
+  company: z.string().nullable().optional(),
+  source: z.string().nullable().optional(),
+  status: z.enum(["new", "contacted", "qualified", "booked", "lost"]).optional(),
+  score: z.number().optional(),
+  value: z.number().nullable().optional(),
+  city: z.string().nullable().optional(),
+  notes: z.string().nullable().optional(),
+});
+
 router.post("/bulk", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
@@ -84,6 +97,40 @@ router.get("/activity/feed", async (c) => {
     ...calls.map((e) => ({ id: `c-${e.id}`, type: "call", text: `Call — ${e.status}${e.outcome ? ` · ${e.outcome}` : ""}`, when: e.created_at })),
   ].sort((a, b) => +new Date(b.when) - +new Date(a.when)).slice(0, 8);
   return c.json(items);
+});
+
+router.get("/:id", async (c) => {
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const row = (await (await getDb()).execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [c.req.param("id")] })).rows[0];
+  if (!row) return c.json({ error: "Lead not found" }, 404);
+  return c.json(row);
+});
+
+router.put("/:id", async (c) => {
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const id = c.req.param("id");
+  const data = updateLeadSchema.parse(await c.req.json());
+  const db = await getDb();
+  const sets: string[] = [];
+  const vals: (string | number | null)[] = [];
+  for (const [k, v] of Object.entries(data)) {
+    sets.push(`${k} = ?`);
+    vals.push(v as string | number | null);
+  }
+  sets.push("last_activity = ?");
+  vals.push(new Date().toISOString());
+  vals.push(id);
+  await db.execute({ sql: `UPDATE leads SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  const row = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0];
+  if (!row) return c.json({ error: "Lead not found" }, 404);
+  return c.json(row);
+});
+
+router.delete("/:id", async (c) => {
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const id = c.req.param("id");
+  await (await getDb()).execute({ sql: "DELETE FROM leads WHERE id = ?", args: [id] });
+  return c.json({ success: true });
 });
 
 export default router;

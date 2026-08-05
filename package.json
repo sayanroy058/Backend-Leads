@@ -6,8 +6,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "start": "node --import tsx/esm src/index.ts",
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "start": "node --env-file=.env --import tsx/esm src/index.ts",
     "build": "esbuild src/vercel.ts --bundle --platform=node --format=esm --target=node20 --packages=external --outfile=api/index.js",
     "typecheck": "tsc --noEmit"
   },
