@@ -48,7 +48,7 @@ var TABLE_DDL = [
     company TEXT,
     source TEXT,
     status TEXT DEFAULT 'new' CHECK(status IN ('new','contacted','qualified','booked','lost')),
-    score INTEGER DEFAULT 50,
+    score INTEGER DEFAULT 0,
     value REAL,
     city TEXT,
     notes TEXT,
@@ -268,6 +268,15 @@ var updateLeadSchema = z2.object({
   city: z2.string().nullable().optional(),
   notes: z2.string().nullable().optional()
 });
+var SCORE_FIELDS = ["email", "phone", "company", "city", "notes", "value"];
+function computeLeadScore(r) {
+  let present = 0;
+  for (const f of SCORE_FIELDS) {
+    const v = r[f];
+    if (v !== void 0 && v !== null && String(v).trim() !== "") present++;
+  }
+  return Math.round(present / SCORE_FIELDS.length * 100);
+}
 router2.post("/bulk", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
@@ -280,9 +289,9 @@ router2.post("/bulk", async (c) => {
     const now = (/* @__PURE__ */ new Date()).toISOString();
     statements.push({
       sql: "INSERT OR REPLACE INTO leads (id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      args: [id, r.name, r.email ?? null, r.phone ?? null, r.company ?? null, r.source ?? "import", r.status ?? "new", r.score ?? 50, r.value ?? null, r.city ?? null, r.notes ?? null, now, now]
+      args: [id, r.name, r.email ?? null, r.phone ?? null, r.company ?? null, r.source ?? "import", r.status ?? "new", computeLeadScore(r), r.value ?? null, r.city ?? null, r.notes ?? null, now, now]
     });
-    inserted.push({ ...r, id, status: r.status ?? "new", score: r.score ?? 50, last_activity: now, created_at: now });
+    inserted.push({ ...r, id, status: r.status ?? "new", score: computeLeadScore(r), last_activity: now, created_at: now });
   }
   if (statements.length) await db.batch(statements, "write");
   return c.json(inserted);
@@ -333,18 +342,23 @@ router2.put("/:id", async (c) => {
   const id = c.req.param("id");
   const data = updateLeadSchema.parse(await c.req.json());
   const db = await getDb();
+  const existing = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0];
+  if (!existing) return c.json({ error: "Lead not found" }, 404);
+  const score = computeLeadScore({ ...existing, ...data });
   const sets = [];
   const vals = [];
   for (const [k, v] of Object.entries(data)) {
+    if (k === "score") continue;
     sets.push(`${k} = ?`);
     vals.push(v);
   }
+  sets.push("score = ?");
+  vals.push(score);
   sets.push("last_activity = ?");
   vals.push((/* @__PURE__ */ new Date()).toISOString());
   vals.push(id);
   await db.execute({ sql: `UPDATE leads SET ${sets.join(", ")} WHERE id = ?`, args: vals });
   const row = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0];
-  if (!row) return c.json({ error: "Lead not found" }, 404);
   return c.json(row);
 });
 router2.delete("/:id", async (c) => {

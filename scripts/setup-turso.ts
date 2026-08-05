@@ -41,7 +41,7 @@ async function setup() {
       company TEXT,
       source TEXT,
       status TEXT DEFAULT 'new' CHECK(status IN ('new','contacted','qualified','booked','lost')),
-      score INTEGER DEFAULT 50,
+      score INTEGER DEFAULT 0,
       value REAL,
       city TEXT,
       notes TEXT,
