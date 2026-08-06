@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { InStatement } from "@libsql/client";
 import { getDb } from "../db";
 import { authenticate } from "../middleware/auth";
+import { sendMessage, listMessages, getMessage } from "../lib/agentmail";
 
 const router = new Hono();
 
@@ -55,6 +56,97 @@ router.post("/emails/status", async (c) => {
   await db.execute({ sql: `UPDATE email_messages SET ${sets.join(", ")} WHERE id = ?`, args: vals });
   return c.json({ success: true });
 });
+
+// Actually send an email draft through AgentMail (sayanazure@agentmail.to).
+router.post("/emails/send", async (c) => {
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const { id } = z.object({ id: z.string() }).parse(await c.req.json());
+  const db = await getDb();
+  const row = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0] as unknown as
+    | { lead_id: string | null; subject: string; body: string }
+    | undefined;
+  if (!row) return c.json({ error: "Email not found" }, 404);
+  if (!row.lead_id) return c.json({ error: "Email is not linked to a lead" }, 400);
+  const lead = (await db.execute({ sql: "SELECT email FROM leads WHERE id = ?", args: [row.lead_id] })).rows[0] as unknown as
+    | { email: string | null }
+    | undefined;
+  if (!lead?.email) return c.json({ error: "Lead has no email address — add one before sending" }, 400);
+  try {
+    const sent = await sendMessage({ to: lead.email, subject: row.subject, text: row.body });
+    const inbox = process.env.AGENTMAIL_INBOX ?? "";
+    const now = new Date().toISOString();
+    await db.execute({
+      sql: "UPDATE email_messages SET status = 'sent', sent_at = ?, from_email = ?, to_email = ?, agentmail_message_id = ?, agentmail_thread_id = ? WHERE id = ?",
+      args: [now, inbox, lead.email, sent.message_id ?? null, sent.thread_id ?? null, id],
+    });
+    await db.execute({ sql: "UPDATE leads SET status = 'contacted', last_activity = ? WHERE id = ?", args: [now, row.lead_id] });
+    const updated = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0];
+    return c.json(updated);
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 502);
+  }
+});
+
+// Pull the latest inbound mail from the AgentMail inbox into email_messages.
+router.post("/emails/sync", async (c) => {
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  let msgs: any[] = [];
+  try {
+    const res = await listMessages({ limit: 50 });
+    msgs = Array.isArray(res.messages) ? res.messages : [];
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 502);
+  }
+  let synced = 0;
+  for (const m of msgs) {
+    if (!m.message_id) continue;
+    if (Array.isArray(m.labels) && m.labels.includes("sent")) continue; // outbound copy
+    const existing = (await db.execute({ sql: "SELECT id FROM email_messages WHERE agentmail_message_id = ?", args: [m.message_id] })).rows[0];
+    if (existing) continue; // already synced
+    let full = m;
+    try {
+      full = await getMessage(m.message_id); // list omits bodies — fetch content
+    } catch { /* keep metadata-only */ }
+    const fromEmail = extractEmail(full.from);
+    const toEmail = Array.isArray(full.to) ? full.to[0] ?? null : typeof full.to === "string" ? full.to : null;
+    const body = full.extracted_text ?? full.text ?? stripHtml(full.extracted_html ?? full.html);
+    let leadId: string | null = null;
+    if (fromEmail) {
+      const lead = (await db.execute({ sql: "SELECT id FROM leads WHERE email = ?", args: [fromEmail] })).rows[0] as unknown as
+        | { id: string }
+        | undefined;
+      if (lead) leadId = lead.id;
+    }
+    await db.execute({
+      sql: "INSERT INTO email_messages (id, lead_id, subject, body, direction, status, from_email, to_email, agentmail_message_id, agentmail_thread_id, created_at) VALUES (?, ?, ?, ?, 'inbound', 'received', ?, ?, ?, ?, ?)",
+      args: [crypto.randomUUID(), leadId, full.subject ?? null, body, fromEmail, toEmail, full.message_id, full.thread_id ?? null, full.timestamp ?? new Date().toISOString()],
+    });
+    synced++;
+  }
+  return c.json({ synced, total: msgs.length });
+});
+
+/** Pull the email address out of a display string like "Name <user@example.com>". */
+function extractEmail(from: unknown): string | null {
+  if (!from) return null;
+  const s = String(from).trim();
+  const m = s.match(/<([^<>]+)>/);
+  return (m ? m[1] : s) || null;
+}
+
+/** Crude HTML → text for preview bodies when no plain-text part exists. */
+function stripHtml(html: unknown): string | null {
+  if (!html) return null;
+  return String(html)
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 2000);
+}
 
 // ---- WhatsApp ----
 router.get("/whatsapps", async (c) => {

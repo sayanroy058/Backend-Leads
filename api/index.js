@@ -114,6 +114,14 @@ var TABLE_DDL = [
     created_at TEXT DEFAULT (datetime('now'))
   )`
 ];
+var EMAIL_MESSAGE_MIGRATIONS = [
+  `ALTER TABLE email_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
+  `ALTER TABLE email_messages ADD COLUMN from_email TEXT`,
+  `ALTER TABLE email_messages ADD COLUMN to_email TEXT`,
+  `ALTER TABLE email_messages ADD COLUMN agentmail_message_id TEXT`,
+  `ALTER TABLE email_messages ADD COLUMN agentmail_thread_id TEXT`,
+  `ALTER TABLE email_messages ADD COLUMN labels TEXT`
+];
 var DEMO_USER_HASH = "$2b$10$/ixfDGIckZ5KISPFS5y7puGhS4MGJkUJHkrdgDMG.si2aBQtWHy2u";
 async function initDb(c) {
   await c.batch(
@@ -126,6 +134,12 @@ async function initDb(c) {
     ],
     "write"
   );
+  for (const sql of EMAIL_MESSAGE_MIGRATIONS) {
+    try {
+      await c.execute(sql);
+    } catch {
+    }
+  }
 }
 async function getDb() {
   const c = getClient();
@@ -372,6 +386,51 @@ var leads_default = router2;
 // src/routes/messages.ts
 import { Hono as Hono3 } from "hono";
 import { z as z3 } from "zod";
+
+// src/lib/agentmail.ts
+var API_BASE = (process.env.AGENTMAIL_API_BASE ?? "https://api.agentmail.to/v0").replace(/\/+$/, "");
+function agentmailConfig() {
+  const apiKey = process.env.AGENTMAIL_API_KEY;
+  const inbox = process.env.AGENTMAIL_INBOX;
+  if (!apiKey || !inbox) {
+    throw new Error("AGENTMAIL_API_KEY and AGENTMAIL_INBOX must be set");
+  }
+  return { apiKey, inbox };
+}
+async function agentmailFetch(path, init) {
+  const { apiKey } = agentmailConfig();
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      ...init?.headers ?? {}
+    }
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`AgentMail ${init?.method ?? "GET"} ${path} failed (${res.status}): ${detail.slice(0, 500)}`);
+  }
+  return res.json();
+}
+async function sendMessage(args) {
+  const { inbox } = agentmailConfig();
+  return agentmailFetch(`/inboxes/${encodeURIComponent(inbox)}/messages/send`, {
+    method: "POST",
+    headers: { "Idempotency-Key": crypto.randomUUID() },
+    body: JSON.stringify({ to: args.to, subject: args.subject, text: args.text, ...args.html ? { html: args.html } : {} })
+  });
+}
+async function listMessages(args = {}) {
+  const { inbox } = agentmailConfig();
+  return agentmailFetch(`/inboxes/${encodeURIComponent(inbox)}/messages?limit=${args.limit ?? 50}`);
+}
+async function getMessage(messageId) {
+  const { inbox } = agentmailConfig();
+  return agentmailFetch(`/inboxes/${encodeURIComponent(inbox)}/messages/${encodeURIComponent(messageId)}`);
+}
+
+// src/routes/messages.ts
 var router3 = new Hono3();
 router3.get("/chat", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
@@ -426,6 +485,77 @@ router3.post("/emails/status", async (c) => {
   await db.execute({ sql: `UPDATE email_messages SET ${sets.join(", ")} WHERE id = ?`, args: vals });
   return c.json({ success: true });
 });
+router3.post("/emails/send", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const { id } = z3.object({ id: z3.string() }).parse(await c.req.json());
+  const db = await getDb();
+  const row = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0];
+  if (!row) return c.json({ error: "Email not found" }, 404);
+  if (!row.lead_id) return c.json({ error: "Email is not linked to a lead" }, 400);
+  const lead = (await db.execute({ sql: "SELECT email FROM leads WHERE id = ?", args: [row.lead_id] })).rows[0];
+  if (!lead?.email) return c.json({ error: "Lead has no email address \u2014 add one before sending" }, 400);
+  try {
+    const sent = await sendMessage({ to: lead.email, subject: row.subject, text: row.body });
+    const inbox = process.env.AGENTMAIL_INBOX ?? "";
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    await db.execute({
+      sql: "UPDATE email_messages SET status = 'sent', sent_at = ?, from_email = ?, to_email = ?, agentmail_message_id = ?, agentmail_thread_id = ? WHERE id = ?",
+      args: [now, inbox, lead.email, sent.message_id ?? null, sent.thread_id ?? null, id]
+    });
+    await db.execute({ sql: "UPDATE leads SET status = 'contacted', last_activity = ? WHERE id = ?", args: [now, row.lead_id] });
+    const updated = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0];
+    return c.json(updated);
+  } catch (e) {
+    return c.json({ error: e.message }, 502);
+  }
+});
+router3.post("/emails/sync", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  let msgs = [];
+  try {
+    const res = await listMessages({ limit: 50 });
+    msgs = Array.isArray(res.messages) ? res.messages : [];
+  } catch (e) {
+    return c.json({ error: e.message }, 502);
+  }
+  let synced = 0;
+  for (const m of msgs) {
+    if (!m.message_id) continue;
+    if (Array.isArray(m.labels) && m.labels.includes("sent")) continue;
+    const existing = (await db.execute({ sql: "SELECT id FROM email_messages WHERE agentmail_message_id = ?", args: [m.message_id] })).rows[0];
+    if (existing) continue;
+    let full = m;
+    try {
+      full = await getMessage(m.message_id);
+    } catch {
+    }
+    const fromEmail = extractEmail(full.from);
+    const toEmail = Array.isArray(full.to) ? full.to[0] ?? null : typeof full.to === "string" ? full.to : null;
+    const body = full.extracted_text ?? full.text ?? stripHtml(full.extracted_html ?? full.html);
+    let leadId = null;
+    if (fromEmail) {
+      const lead = (await db.execute({ sql: "SELECT id FROM leads WHERE email = ?", args: [fromEmail] })).rows[0];
+      if (lead) leadId = lead.id;
+    }
+    await db.execute({
+      sql: "INSERT INTO email_messages (id, lead_id, subject, body, direction, status, from_email, to_email, agentmail_message_id, agentmail_thread_id, created_at) VALUES (?, ?, ?, ?, 'inbound', 'received', ?, ?, ?, ?, ?)",
+      args: [crypto.randomUUID(), leadId, full.subject ?? null, body, fromEmail, toEmail, full.message_id, full.thread_id ?? null, full.timestamp ?? (/* @__PURE__ */ new Date()).toISOString()]
+    });
+    synced++;
+  }
+  return c.json({ synced, total: msgs.length });
+});
+function extractEmail(from) {
+  if (!from) return null;
+  const s = String(from).trim();
+  const m = s.match(/<([^<>]+)>/);
+  return (m ? m[1] : s) || null;
+}
+function stripHtml(html) {
+  if (!html) return null;
+  return String(html).replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim().slice(0, 2e3);
+}
 router3.get("/whatsapps", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
   const rows = (await (await getDb()).execute("SELECT * FROM whatsapp_messages ORDER BY created_at DESC LIMIT 100")).rows;

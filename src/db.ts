@@ -109,6 +109,18 @@ const TABLE_DDL = [
   )`,
 ];
 
+// Column migrations for tables created before these columns existed.
+// ALTER TABLE fails with "duplicate column name" once applied, so each
+// statement is attempted and the error is swallowed — idempotent across cold starts.
+const EMAIL_MESSAGE_MIGRATIONS = [
+  `ALTER TABLE email_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
+  `ALTER TABLE email_messages ADD COLUMN from_email TEXT`,
+  `ALTER TABLE email_messages ADD COLUMN to_email TEXT`,
+  `ALTER TABLE email_messages ADD COLUMN agentmail_message_id TEXT`,
+  `ALTER TABLE email_messages ADD COLUMN agentmail_thread_id TEXT`,
+  `ALTER TABLE email_messages ADD COLUMN labels TEXT`,
+];
+
 // Hardcoded demo account so login works out of the box.
 //   email:    testuser@gmail.com
 //   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
@@ -129,6 +141,16 @@ async function initDb(c: Client) {
     ],
     "write"
   );
+
+  // Column migrations run individually — ALTER TABLE cannot be batched with
+  // a guaranteed outcome, and duplicate-column errors are expected once applied.
+  for (const sql of EMAIL_MESSAGE_MIGRATIONS) {
+    try {
+      await c.execute(sql);
+    } catch {
+      // column already exists — ignore
+    }
+  }
 }
 
 /**
