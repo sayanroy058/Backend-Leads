@@ -4,6 +4,8 @@ import type { InStatement } from "@libsql/client";
 import { getDb } from "../db";
 import { authenticate } from "../middleware/auth";
 import { sendMessage, listMessages, getMessage } from "../lib/agentmail";
+import { insertEvent } from "../lib/events";
+import { computeLeadScore } from "./leads";
 
 const router = new Hono();
 
@@ -80,6 +82,15 @@ router.post("/emails/send", async (c) => {
       args: [now, inbox, lead.email, sent.message_id ?? null, sent.thread_id ?? null, id],
     });
     await db.execute({ sql: "UPDATE leads SET status = 'contacted', last_activity = ? WHERE id = ?", args: [now, row.lead_id] });
+    await insertEvent(db, {
+      lead_id: row.lead_id,
+      channel: "email",
+      action: "sent",
+      summary: row.subject,
+      source_ref: id,
+      metadata: { message_id: sent.message_id ?? null, thread_id: sent.thread_id ?? null, to: lead.email },
+      created_at: now,
+    });
     const updated = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0];
     return c.json(updated);
   } catch (e) {
@@ -116,11 +127,34 @@ router.post("/emails/sync", async (c) => {
       const lead = (await db.execute({ sql: "SELECT id FROM leads WHERE email = ?", args: [fromEmail] })).rows[0] as unknown as
         | { id: string }
         | undefined;
-      if (lead) leadId = lead.id;
+      if (lead) {
+        leadId = lead.id;
+      } else {
+        // Unmatched sender → create a contact from the inbound email.
+        const now = new Date().toISOString();
+        const newId = crypto.randomUUID();
+        const name = extractName(full.from) ?? fromEmail;
+        await db.execute({
+          sql: "INSERT INTO leads (id, name, email, source, status, score, last_activity, created_at) VALUES (?, ?, ?, 'inbound email', 'new', ?, ?, ?)",
+          args: [newId, name, fromEmail, computeLeadScore({ email: fromEmail, name }), now, now],
+        });
+        leadId = newId;
+      }
     }
+    const emailRowId = crypto.randomUUID();
+    const emailCreatedAt = full.timestamp ?? new Date().toISOString();
     await db.execute({
       sql: "INSERT INTO email_messages (id, lead_id, subject, body, direction, status, from_email, to_email, agentmail_message_id, agentmail_thread_id, created_at) VALUES (?, ?, ?, ?, 'inbound', 'received', ?, ?, ?, ?, ?)",
-      args: [crypto.randomUUID(), leadId, full.subject ?? null, body, fromEmail, toEmail, full.message_id, full.thread_id ?? null, full.timestamp ?? new Date().toISOString()],
+      args: [emailRowId, leadId, full.subject ?? null, body, fromEmail, toEmail, full.message_id, full.thread_id ?? null, emailCreatedAt],
+    });
+    await insertEvent(db, {
+      lead_id: leadId,
+      channel: "email",
+      action: "received",
+      summary: full.subject ?? "(no subject)",
+      source_ref: emailRowId,
+      metadata: { from: fromEmail, message_id: full.message_id },
+      created_at: emailCreatedAt,
     });
     synced++;
   }
@@ -133,6 +167,13 @@ function extractEmail(from: unknown): string | null {
   const s = String(from).trim();
   const m = s.match(/<([^<>]+)>/);
   return (m ? m[1] : s) || null;
+}
+
+/** Pull the display name out of "Name <user@example.com>", if present. */
+function extractName(from: unknown): string | null {
+  if (!from) return null;
+  const m = String(from).trim().match(/^(.*?)\s*<[^<>]+>$/);
+  return m && m[1].trim() ? m[1].trim() : null;
 }
 
 /** Crude HTML → text for preview bodies when no plain-text part exists. */
@@ -159,10 +200,14 @@ router.post("/whatsapps", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const data = z.array(z.object({ lead_id: z.string(), body: z.string(), status: z.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  const statements: InStatement[] = data.map((r) => ({
-    sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)",
-    args: [crypto.randomUUID(), r.lead_id, r.body, r.status ?? "draft"],
-  }));
+  const now = new Date().toISOString();
+  const statements: InStatement[] = data.flatMap((r) => {
+    const id = crypto.randomUUID();
+    return [
+      { sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)", args: [id, r.lead_id, r.body, r.status ?? "draft"] },
+      { sql: "INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'whatsapp', ?, ?, ?, ?)", args: [crypto.randomUUID(), r.lead_id, r.status ?? "draft", r.body.slice(0, 120), id, now] },
+    ];
+  });
   if (statements.length) await db.batch(statements, "write"); // atomic insert
   return c.json({ success: true });
 });
@@ -177,6 +222,8 @@ router.post("/whatsapps/status", async (c) => {
   if (d.read_at) { sets.push("read_at = ?"); vals.push(d.read_at); }
   vals.push(d.id);
   await db.execute({ sql: `UPDATE whatsapp_messages SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  const w = (await db.execute({ sql: "SELECT lead_id FROM whatsapp_messages WHERE id = ?", args: [d.id] })).rows[0] as unknown as { lead_id: string | null } | undefined;
+  await insertEvent(db, { lead_id: w?.lead_id ?? null, channel: "whatsapp", action: d.status, source_ref: d.id });
   return c.json({ success: true });
 });
 
@@ -191,10 +238,14 @@ router.post("/calls", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const data = z.array(z.object({ lead_id: z.string(), goal: z.string().optional(), voice: z.string().optional(), status: z.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  const statements: InStatement[] = data.map((r) => ({
-    sql: "INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)",
-    args: [crypto.randomUUID(), r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"],
-  }));
+  const now = new Date().toISOString();
+  const statements: InStatement[] = data.flatMap((r) => {
+    const id = crypto.randomUUID();
+    return [
+      { sql: "INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)", args: [id, r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"] },
+      { sql: "INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'call', ?, ?, ?, ?)", args: [crypto.randomUUID(), r.lead_id, r.status ?? "queued", r.goal ?? null, id, now] },
+    ];
+  });
   if (statements.length) await db.batch(statements, "write"); // atomic insert
   const rows = (await db.execute("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 50")).rows;
   return c.json(rows);
@@ -215,6 +266,8 @@ router.post("/calls/status", async (c) => {
   if (!sets.length) return c.json({ success: true });
   vals.push(d.id);
   await db.execute({ sql: `UPDATE call_logs SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  const cl = (await db.execute({ sql: "SELECT lead_id FROM call_logs WHERE id = ?", args: [d.id] })).rows[0] as unknown as { lead_id: string | null } | undefined;
+  await insertEvent(db, { lead_id: cl?.lead_id ?? null, channel: "call", action: d.outcome ?? d.status ?? "updated", source_ref: d.id });
   return c.json({ success: true });
 });
 

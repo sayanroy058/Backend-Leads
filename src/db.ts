@@ -107,6 +107,18 @@ const TABLE_DDL = [
     citations TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
+  `CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT,
+    channel TEXT NOT NULL CHECK(channel IN ('email','whatsapp','call')),
+    action TEXT NOT NULL,
+    summary TEXT,
+    source_ref TEXT,
+    metadata TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`,
 ];
 
 // Column migrations for tables created before these columns existed.
@@ -151,6 +163,26 @@ async function initDb(c: Client) {
       // column already exists — ignore
     }
   }
+
+  // Backfill events from pre-existing channel rows so the activity feed has
+  // history. Idempotent: INSERT OR IGNORE + unique (channel, source_ref).
+  await c.execute(`
+    INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
+    SELECT 'evt-' || id, lead_id, 'email',
+           CASE WHEN direction = 'inbound' THEN 'received' ELSE COALESCE(status, 'sent') END,
+           subject, id, created_at
+    FROM email_messages
+  `);
+  await c.execute(`
+    INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
+    SELECT 'evt-' || id, lead_id, 'whatsapp', COALESCE(status, 'sent'), NULL, id, created_at
+    FROM whatsapp_messages
+  `);
+  await c.execute(`
+    INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
+    SELECT 'evt-' || id, lead_id, 'call', COALESCE(status, 'pending'), goal, id, created_at
+    FROM call_logs
+  `);
 }
 
 /**

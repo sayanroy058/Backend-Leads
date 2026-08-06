@@ -42,7 +42,7 @@ const updateLeadSchema = z.object({
 const SCORE_FIELDS = ["email", "phone", "company", "city", "notes", "value"] as const;
 
 // Score 0-100 based on how many lead fields are filled vs. missing.
-function computeLeadScore(r: Record<string, unknown>): number {
+export function computeLeadScore(r: Record<string, unknown>): number {
   let present = 0;
   for (const f of SCORE_FIELDS) {
     const v = r[f];
@@ -100,15 +100,25 @@ router.get("/activity/feed", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const db = await getDb();
-  const emails = (await db.execute("SELECT id, subject, status, created_at FROM email_messages ORDER BY created_at DESC LIMIT 20")).rows as unknown as { id: string; subject: string; status: string; created_at: string }[];
-  const was = (await db.execute("SELECT id, status, created_at FROM whatsapp_messages ORDER BY created_at DESC LIMIT 20")).rows as unknown as { id: string; status: string; created_at: string }[];
-  const calls = (await db.execute("SELECT id, status, outcome, created_at FROM call_logs ORDER BY created_at DESC LIMIT 20")).rows as unknown as { id: string; status: string; outcome: string | null; created_at: string }[];
-  const items = [
-    ...emails.map((e) => ({ id: `e-${e.id}`, type: "email", text: `Email "${e.subject}" — ${e.status}`, when: e.created_at })),
-    ...was.map((e) => ({ id: `w-${e.id}`, type: "whatsapp", text: `WhatsApp message — ${e.status}`, when: e.created_at })),
-    ...calls.map((e) => ({ id: `c-${e.id}`, type: "call", text: `Call — ${e.status}${e.outcome ? ` · ${e.outcome}` : ""}`, when: e.created_at })),
-  ].sort((a, b) => +new Date(b.when) - +new Date(a.when)).slice(0, 8);
-  return c.json(items);
+  const rows = (await db.execute("SELECT id, channel, action, summary, created_at FROM events ORDER BY created_at DESC LIMIT 20")).rows as unknown as {
+    id: string;
+    channel: "email" | "whatsapp" | "call";
+    action: string;
+    summary: string | null;
+    created_at: string;
+  }[];
+  const items = rows.map((e) => ({
+    id: e.id,
+    type: e.channel,
+    text:
+      e.channel === "email"
+        ? `Email "${e.summary ?? ""}" — ${e.action}`
+        : e.channel === "whatsapp"
+          ? `WhatsApp message — ${e.action}`
+          : `Call — ${e.action}`,
+    when: e.created_at,
+  }));
+  return c.json(items.slice(0, 8));
 });
 
 router.get("/:id", async (c) => {
