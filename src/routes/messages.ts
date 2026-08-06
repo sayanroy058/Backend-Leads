@@ -57,7 +57,7 @@ router.post("/emails/status", async (c) => {
   return c.json({ success: true });
 });
 
-// Actually send an email draft through AgentMail (sayanazure@agentmail.to).
+// Actually send an email draft through AgentMail (leads-test@agentmail.to).
 router.post("/emails/send", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const { id } = z.object({ id: z.string() }).parse(await c.req.json());
