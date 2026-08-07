@@ -5,6 +5,7 @@ import authRoutes from "./routes/auth";
 import leadsRoutes from "./routes/leads";
 import messagesRoutes from "./routes/messages";
 import aiRoutes from "./routes/ai";
+import conversationsRoutes from "./routes/conversations";
 import whatsappWebhookRoutes from "./routes/whatsapp-webhook";
 
 const extraOrigins = (process.env.CORS_ORIGINS ?? "")
@@ -28,6 +29,7 @@ app.route("/api/auth", authRoutes);
 app.route("/api/leads", leadsRoutes);
 app.route("/api/messages", messagesRoutes);
 app.route("/api/ai", aiRoutes);
+app.route("/api/conversations", conversationsRoutes);
 app.route("/api/webhooks/whatsapp", whatsappWebhookRoutes); // public — Meta/bridge webhook
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));

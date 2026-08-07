@@ -100,24 +100,31 @@ router.get("/activity/feed", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const db = await getDb();
-  const rows = (await db.execute("SELECT id, channel, action, summary, created_at FROM events ORDER BY created_at DESC LIMIT 20")).rows as unknown as {
+  const rows = (await db.execute("SELECT id, type, channel, direction, action, summary, content, created_at FROM events WHERE channel IN ('email','whatsapp','call') ORDER BY created_at DESC LIMIT 20")).rows as unknown as {
     id: string;
-    channel: "email" | "whatsapp" | "call";
+    type: string | null;
+    channel: string;
+    direction: string | null;
     action: string;
     summary: string | null;
+    content: string | null;
     created_at: string;
   }[];
-  const items = rows.map((e) => ({
-    id: e.id,
-    type: e.channel,
-    text:
-      e.channel === "email"
-        ? `Email "${e.summary ?? ""}" — ${e.action}`
-        : e.channel === "whatsapp"
-          ? `WhatsApp message — ${e.action}`
-          : `Call — ${e.action}`,
-    when: e.created_at,
-  }));
+  const items = rows.map((e) => {
+    const dir = e.direction === "inbound" ? "inbound" : "outbound";
+    const body = e.content ?? e.summary ?? "";
+    return {
+      id: e.id,
+      type: e.type ?? e.channel,
+      text:
+        e.channel === "email"
+          ? `${dir === "inbound" ? "Inbound" : "Sent"} email — ${e.action}: "${e.summary ?? ""}"`
+          : e.channel === "whatsapp"
+            ? `${dir === "inbound" ? "Inbound WhatsApp" : "Outbound WhatsApp"} — ${body.slice(0, 80)}`
+            : `Call — ${e.action}${e.summary ? `: ${e.summary}` : ""}`,
+      when: e.created_at,
+    };
+  });
   return c.json(items.slice(0, 8));
 });
 

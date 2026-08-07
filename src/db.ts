@@ -1,4 +1,5 @@
 import { createClient, type Client } from "@libsql/client";
+import { slaDueAfter, computeSlaStatus } from "./lib/conversations";
 
 let client: Client | undefined;
 let initPromise: Promise<void> | undefined;
@@ -107,18 +108,40 @@ const TABLE_DDL = [
     citations TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
+  `CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','active','awaiting_reply','resolved','archived')),
+    sla_due_at TEXT,
+    sla_status TEXT NOT NULL DEFAULT 'none' CHECK(sla_status IN ('none','within_sla','breached')),
+    first_event_at TEXT,
+    last_event_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT,
+    UNIQUE (lead_id),
+    FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  )`,
   `CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
+    conversation_id TEXT,
     lead_id TEXT,
-    channel TEXT NOT NULL CHECK(channel IN ('email','whatsapp','call')),
+    type TEXT,
+    channel TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'internal',
+    content TEXT,
+    handled_by TEXT NOT NULL DEFAULT 'unhandled',
+    status TEXT,
     action TEXT NOT NULL,
     summary TEXT,
     source_ref TEXT,
     metadata TEXT,
     created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
+    FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email)`,
+  `CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone)`,
 ];
 
 // Column migrations for tables created before these columns existed.
@@ -195,6 +218,123 @@ async function initDb(c: Client) {
     SELECT 'evt-' || id, lead_id, 'call', COALESCE(status, 'pending'), goal, id, created_at
     FROM call_logs
   `);
+
+  // Phase 0 — unify onto the Conversation/Event model (idempotent).
+  await migrateEventsToConversations(c);
+}
+
+/**
+ * Build the Phase 0 foundation:
+ *   1. Rebuild `events` onto the channel-agnostic schema (one-time, guarded).
+ *   2. Ensure every lead has exactly one conversation.
+ *   3. Link all existing events into their conversation.
+ *   4. Infer type / direction / handled_by / content for legacy rows.
+ *   5. Recompute conversation timeline + SLA.
+ */
+async function migrateEventsToConversations(c: Client) {
+  // Guard: skip the rebuild if the unified columns already exist.
+  if (!(await tableHasColumn(c, "events", "conversation_id"))) {
+    await c.batch(
+      [
+        `CREATE TABLE events_foundation (
+          id TEXT PRIMARY KEY,
+          conversation_id TEXT,
+          lead_id TEXT,
+          type TEXT,
+          channel TEXT NOT NULL,
+          direction TEXT NOT NULL DEFAULT 'internal',
+          content TEXT,
+          handled_by TEXT NOT NULL DEFAULT 'unhandled',
+          status TEXT,
+          action TEXT NOT NULL,
+          summary TEXT,
+          source_ref TEXT,
+          metadata TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL,
+          FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )`,
+        `INSERT INTO events_foundation (id, lead_id, channel, action, summary, source_ref, metadata, created_at)
+           SELECT id, lead_id, channel, action, summary, source_ref, metadata, created_at FROM events`,
+        `DROP TABLE events`,
+        `ALTER TABLE events_foundation RENAME TO events`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`,
+        `CREATE INDEX IF NOT EXISTS idx_events_conversation ON events(conversation_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_events_lead ON events(lead_id)`,
+      ],
+      "write"
+    );
+  }
+
+  // These indexes need the unified columns, so they're created here — after the
+  // rebuild — on both fresh and migrated databases.
+  await c.batch(
+    [
+      `CREATE INDEX IF NOT EXISTS idx_events_conversation ON events(conversation_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_events_lead ON events(lead_id)`,
+    ],
+    "write"
+  );
+
+  // One conversation per contact.
+  await c.execute(`
+    INSERT OR IGNORE INTO conversations (id, lead_id, status, sla_status, created_at)
+    SELECT 'conv-' || id, id, 'new', 'none', datetime('now') FROM leads
+  `);
+
+  // Link events to their conversation.
+  await c.execute(`
+    UPDATE events SET conversation_id = 'conv-' || lead_id
+    WHERE conversation_id IS NULL AND lead_id IS NOT NULL
+  `);
+
+  // Infer type + content for legacy rows.
+  await c.execute(`
+    UPDATE events SET type = COALESCE(type, channel), content = COALESCE(content, summary)
+    WHERE type IS NULL OR content IS NULL
+  `);
+
+  // Infer direction + handled_by for legacy backfilled channel rows only
+  // (real events already carry these explicitly).
+  await c.execute(`
+    UPDATE events SET
+      direction = CASE
+        WHEN COALESCE(action,'') IN ('received','inbound','auto-acknowledged') THEN 'inbound'
+        WHEN channel = 'call' THEN 'outbound' ELSE 'outbound' END,
+      handled_by = CASE WHEN channel = 'call' THEN 'ai'
+        WHEN COALESCE(action,'') IN ('received','inbound','auto-acknowledged') THEN 'unhandled'
+        ELSE 'human' END
+    WHERE direction = 'internal' AND channel IN ('email','whatsapp','call') AND source_ref IS NOT NULL
+  `);
+
+  // Recompute conversation timeline.
+  await c.execute(`
+    UPDATE conversations SET
+      first_event_at = (SELECT MIN(created_at) FROM events WHERE conversation_id = conversations.id),
+      last_event_at  = (SELECT MAX(created_at) FROM events WHERE conversation_id = conversations.id)
+  `);
+
+  // Recompute the SLA timer: earliest inbound-unhandled event + SLA window.
+  const rows = (await c.execute(`
+    SELECT conversation_id, MIN(created_at) AS due0, MAX(created_at) AS last0
+    FROM events
+    WHERE direction = 'inbound' AND handled_by = 'unhandled' AND conversation_id IS NOT NULL
+    GROUP BY conversation_id
+  `)).rows as unknown as { conversation_id: string; due0: string; last0: string }[];
+  for (const r of rows) {
+    const due = slaDueAfter(r.due0);
+    await c.execute({
+      sql: `UPDATE conversations SET sla_due_at = ?, sla_status = ?,
+            status = CASE WHEN status IN ('new','active') THEN 'awaiting_reply' ELSE status END
+            WHERE id = ? AND (sla_due_at IS NULL OR ? < sla_due_at)`,
+      args: [due, computeSlaStatus(due), r.conversation_id, due],
+    });
+  }
+}
+
+async function tableHasColumn(c: Client, table: string, column: string): Promise<boolean> {
+  const r = await c.execute(`SELECT name FROM pragma_table_info('${table}') WHERE name = '${column}' LIMIT 1`);
+  return r.rows.length > 0;
 }
 
 /**

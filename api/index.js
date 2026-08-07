@@ -1,6 +1,6 @@
 // src/index.ts
 import { serve } from "@hono/node-server";
-import { Hono as Hono6 } from "hono";
+import { Hono as Hono7 } from "hono";
 import { cors } from "hono/cors";
 
 // src/routes/auth.ts
@@ -11,6 +11,68 @@ import { verify as argon2Verify } from "@node-rs/argon2";
 
 // src/db.ts
 import { createClient } from "@libsql/client";
+
+// src/lib/conversations.ts
+var SLA_RESPONSE_HOURS = (() => {
+  const v = Number(process.env.SLA_RESPONSE_HOURS);
+  return Number.isFinite(v) && v > 0 ? v : 4;
+})();
+function slaDueAfter(from) {
+  const d = new Date(from);
+  d.setTime(d.getTime() + SLA_RESPONSE_HOURS * 3600 * 1e3);
+  return d.toISOString();
+}
+function computeSlaStatus(dueAt, now = /* @__PURE__ */ new Date()) {
+  if (!dueAt) return "none";
+  return new Date(dueAt).getTime() < now.getTime() ? "breached" : "within_sla";
+}
+async function getOrCreateConversation(db, leadId) {
+  const id = `conv-${leadId}`;
+  await db.execute({
+    sql: `INSERT OR IGNORE INTO conversations (id, lead_id, status, sla_status, created_at)
+          VALUES (?, ?, 'new', 'none', ?)`,
+    args: [id, leadId, (/* @__PURE__ */ new Date()).toISOString()]
+  });
+  const row = (await db.execute({ sql: "SELECT * FROM conversations WHERE id = ?", args: [id] })).rows[0];
+  if (!row) throw new Error("Failed to load conversation");
+  row.sla_due_at = row.sla_due_at ?? null;
+  row.sla_status = computeSlaStatus(row.sla_due_at);
+  return row;
+}
+async function touchConversation(db, ev) {
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const conv = (await db.execute({ sql: "SELECT status, sla_due_at FROM conversations WHERE id = ?", args: [ev.conversation_id] })).rows[0];
+  if (!conv) return;
+  let dueAt = conv.sla_due_at;
+  let status = conv.status;
+  const inbound = ev.direction === "inbound";
+  const isReply = ev.direction === "outbound" || (ev.handledBy === "human" || ev.handledBy === "ai") && ev.direction !== "internal";
+  if (inbound && ev.handledBy === "unhandled") {
+    const due = slaDueAfter(ev.createdAt);
+    if (!dueAt || new Date(due).getTime() < new Date(dueAt).getTime()) dueAt = due;
+    if (status !== "resolved" && status !== "archived") status = "awaiting_reply";
+  } else if (isReply) {
+    dueAt = null;
+    if (status === "awaiting_reply") status = "active";
+  }
+  await db.execute({
+    sql: `UPDATE conversations SET
+      first_event_at = COALESCE(first_event_at, ?),
+      last_event_at = CASE WHEN last_event_at IS NULL OR ? > last_event_at THEN ? ELSE last_event_at END,
+      sla_due_at = ?, sla_status = ?, status = ?, updated_at = ?
+      WHERE id = ?`,
+    args: [ev.createdAt, ev.createdAt, ev.createdAt, dueAt, computeSlaStatus(dueAt), status, nowIso, ev.conversation_id]
+  });
+}
+async function setConversationStatus(db, conversationId, status) {
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  await db.execute({
+    sql: "UPDATE conversations SET status = ?, sla_due_at = NULL, sla_status = 'none', updated_at = ? WHERE id = ?",
+    args: [status, nowIso, conversationId]
+  });
+}
+
+// src/db.ts
 var client;
 var initPromise;
 function getClient() {
@@ -113,18 +175,40 @@ var TABLE_DDL = [
     citations TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
+  `CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','active','awaiting_reply','resolved','archived')),
+    sla_due_at TEXT,
+    sla_status TEXT NOT NULL DEFAULT 'none' CHECK(sla_status IN ('none','within_sla','breached')),
+    first_event_at TEXT,
+    last_event_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT,
+    UNIQUE (lead_id),
+    FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  )`,
   `CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
+    conversation_id TEXT,
     lead_id TEXT,
-    channel TEXT NOT NULL CHECK(channel IN ('email','whatsapp','call')),
+    type TEXT,
+    channel TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'internal',
+    content TEXT,
+    handled_by TEXT NOT NULL DEFAULT 'unhandled',
+    status TEXT,
     action TEXT NOT NULL,
     summary TEXT,
     source_ref TEXT,
     metadata TEXT,
     created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
+    FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
   )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email)`,
+  `CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone)`
 ];
 var EMAIL_MESSAGE_MIGRATIONS = [
   `ALTER TABLE email_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
@@ -178,6 +262,94 @@ async function initDb(c) {
     SELECT 'evt-' || id, lead_id, 'call', COALESCE(status, 'pending'), goal, id, created_at
     FROM call_logs
   `);
+  await migrateEventsToConversations(c);
+}
+async function migrateEventsToConversations(c) {
+  if (!await tableHasColumn(c, "events", "conversation_id")) {
+    await c.batch(
+      [
+        `CREATE TABLE events_foundation (
+          id TEXT PRIMARY KEY,
+          conversation_id TEXT,
+          lead_id TEXT,
+          type TEXT,
+          channel TEXT NOT NULL,
+          direction TEXT NOT NULL DEFAULT 'internal',
+          content TEXT,
+          handled_by TEXT NOT NULL DEFAULT 'unhandled',
+          status TEXT,
+          action TEXT NOT NULL,
+          summary TEXT,
+          source_ref TEXT,
+          metadata TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL,
+          FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )`,
+        `INSERT INTO events_foundation (id, lead_id, channel, action, summary, source_ref, metadata, created_at)
+           SELECT id, lead_id, channel, action, summary, source_ref, metadata, created_at FROM events`,
+        `DROP TABLE events`,
+        `ALTER TABLE events_foundation RENAME TO events`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`,
+        `CREATE INDEX IF NOT EXISTS idx_events_conversation ON events(conversation_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_events_lead ON events(lead_id)`
+      ],
+      "write"
+    );
+  }
+  await c.batch(
+    [
+      `CREATE INDEX IF NOT EXISTS idx_events_conversation ON events(conversation_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_events_lead ON events(lead_id)`
+    ],
+    "write"
+  );
+  await c.execute(`
+    INSERT OR IGNORE INTO conversations (id, lead_id, status, sla_status, created_at)
+    SELECT 'conv-' || id, id, 'new', 'none', datetime('now') FROM leads
+  `);
+  await c.execute(`
+    UPDATE events SET conversation_id = 'conv-' || lead_id
+    WHERE conversation_id IS NULL AND lead_id IS NOT NULL
+  `);
+  await c.execute(`
+    UPDATE events SET type = COALESCE(type, channel), content = COALESCE(content, summary)
+    WHERE type IS NULL OR content IS NULL
+  `);
+  await c.execute(`
+    UPDATE events SET
+      direction = CASE
+        WHEN COALESCE(action,'') IN ('received','inbound','auto-acknowledged') THEN 'inbound'
+        WHEN channel = 'call' THEN 'outbound' ELSE 'outbound' END,
+      handled_by = CASE WHEN channel = 'call' THEN 'ai'
+        WHEN COALESCE(action,'') IN ('received','inbound','auto-acknowledged') THEN 'unhandled'
+        ELSE 'human' END
+    WHERE direction = 'internal' AND channel IN ('email','whatsapp','call') AND source_ref IS NOT NULL
+  `);
+  await c.execute(`
+    UPDATE conversations SET
+      first_event_at = (SELECT MIN(created_at) FROM events WHERE conversation_id = conversations.id),
+      last_event_at  = (SELECT MAX(created_at) FROM events WHERE conversation_id = conversations.id)
+  `);
+  const rows = (await c.execute(`
+    SELECT conversation_id, MIN(created_at) AS due0, MAX(created_at) AS last0
+    FROM events
+    WHERE direction = 'inbound' AND handled_by = 'unhandled' AND conversation_id IS NOT NULL
+    GROUP BY conversation_id
+  `)).rows;
+  for (const r of rows) {
+    const due = slaDueAfter(r.due0);
+    await c.execute({
+      sql: `UPDATE conversations SET sla_due_at = ?, sla_status = ?,
+            status = CASE WHEN status IN ('new','active') THEN 'awaiting_reply' ELSE status END
+            WHERE id = ? AND (sla_due_at IS NULL OR ? < sla_due_at)`,
+      args: [due, computeSlaStatus(due), r.conversation_id, due]
+    });
+  }
+}
+async function tableHasColumn(c, table, column) {
+  const r = await c.execute(`SELECT name FROM pragma_table_info('${table}') WHERE name = '${column}' LIMIT 1`);
+  return r.rows.length > 0;
 }
 async function getDb() {
   const c = getClient();
@@ -373,13 +545,17 @@ router2.get("/activity/feed", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const db = await getDb();
-  const rows = (await db.execute("SELECT id, channel, action, summary, created_at FROM events ORDER BY created_at DESC LIMIT 20")).rows;
-  const items = rows.map((e) => ({
-    id: e.id,
-    type: e.channel,
-    text: e.channel === "email" ? `Email "${e.summary ?? ""}" \u2014 ${e.action}` : e.channel === "whatsapp" ? `WhatsApp message \u2014 ${e.action}` : `Call \u2014 ${e.action}`,
-    when: e.created_at
-  }));
+  const rows = (await db.execute("SELECT id, type, channel, direction, action, summary, content, created_at FROM events WHERE channel IN ('email','whatsapp','call') ORDER BY created_at DESC LIMIT 20")).rows;
+  const items = rows.map((e) => {
+    const dir = e.direction === "inbound" ? "inbound" : "outbound";
+    const body = e.content ?? e.summary ?? "";
+    return {
+      id: e.id,
+      type: e.type ?? e.channel,
+      text: e.channel === "email" ? `${dir === "inbound" ? "Inbound" : "Sent"} email \u2014 ${e.action}: "${e.summary ?? ""}"` : e.channel === "whatsapp" ? `${dir === "inbound" ? "Inbound WhatsApp" : "Outbound WhatsApp"} \u2014 ${body.slice(0, 80)}` : `Call \u2014 ${e.action}${e.summary ? `: ${e.summary}` : ""}`,
+      when: e.created_at
+    };
+  });
   return c.json(items.slice(0, 8));
 });
 router2.get("/:id", async (c) => {
@@ -469,19 +645,42 @@ async function getMessage(messageId) {
 
 // src/lib/events.ts
 async function insertEvent(db, e) {
+  const id = crypto.randomUUID();
+  const createdAt = e.created_at ?? (/* @__PURE__ */ new Date()).toISOString();
+  const type = e.type ?? e.channel;
+  const direction = e.direction ?? "internal";
+  const content = e.content ?? e.summary ?? null;
+  const handledBy = e.handled_by ?? "unhandled";
   await db.execute({
-    sql: "INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    sql: `INSERT INTO events
+      (id, lead_id, channel, action, summary, source_ref, metadata, created_at,
+       type, direction, content, handled_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
-      crypto.randomUUID(),
+      id,
       e.lead_id ?? null,
       e.channel,
       e.action,
       e.summary ?? null,
       e.source_ref ?? null,
       e.metadata !== void 0 ? JSON.stringify(e.metadata) : null,
-      e.created_at ?? (/* @__PURE__ */ new Date()).toISOString()
+      createdAt,
+      type,
+      direction,
+      content,
+      handledBy
     ]
   });
+  if (e.lead_id) {
+    const conv = await getOrCreateConversation(db, e.lead_id);
+    await touchConversation(db, {
+      conversation_id: conv.id,
+      createdAt,
+      direction,
+      handledBy
+    });
+  }
+  return id;
 }
 
 // src/lib/whatsapp.ts
@@ -698,8 +897,12 @@ router3.post("/emails/send", async (c) => {
     await insertEvent(db, {
       lead_id: row.lead_id,
       channel: "email",
+      type: "email",
+      direction: "outbound",
+      handled_by: "human",
       action: "sent",
       summary: row.subject,
+      content: row.body,
       source_ref: id,
       metadata: { message_id: sent.message_id ?? null, thread_id: sent.thread_id ?? null, to: lead.email },
       created_at: now
@@ -759,8 +962,12 @@ router3.post("/emails/sync", async (c) => {
     await insertEvent(db, {
       lead_id: leadId,
       channel: "email",
+      type: "email",
+      direction: "inbound",
+      handled_by: "unhandled",
       action: "received",
       summary: full.subject ?? "(no subject)",
+      content: body,
       source_ref: emailRowId,
       metadata: { from: fromEmail, message_id: full.message_id },
       created_at: emailCreatedAt
@@ -869,8 +1076,12 @@ router3.post("/whatsapps/send", async (c) => {
   await insertEvent(db, {
     lead_id: leadId,
     channel: "whatsapp",
+    type: "whatsapp",
+    direction: "outbound",
+    handled_by: "human",
     action: "sent",
     summary: body.slice(0, 120),
+    content: body,
     source_ref: messageId,
     metadata: { to: lead.phone, provider_message_id: send.providerMessageId, from: fromNumber },
     created_at: now
@@ -1059,11 +1270,84 @@ router4.post("/image", async (c) => {
 });
 var ai_default = router4;
 
-// src/routes/whatsapp-webhook.ts
+// src/routes/conversations.ts
 import { Hono as Hono5 } from "hono";
-var ACK_DEBOUNCE_MS = 5 * 60 * 1e3;
+import { z as z5 } from "zod";
 var router5 = new Hono5();
-router5.get("/", (c) => {
+function enrichSla(conv) {
+  if (conv && typeof conv === "object") {
+    conv.sla_status = computeSlaStatus(conv.sla_due_at ?? null);
+  }
+  return conv;
+}
+router5.get("/", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const status = c.req.query("status");
+  const sla = c.req.query("sla");
+  const db = await getDb();
+  let rows = (await db.execute(`
+    SELECT c.id, c.lead_id, c.status, c.sla_due_at, c.sla_status,
+           c.first_event_at, c.last_event_at, c.created_at,
+           l.name AS lead_name, l.company, l.city, l.phone, l.email, l.source,
+           (SELECT content FROM events e WHERE e.conversation_id = c.id ORDER BY e.created_at DESC LIMIT 1) AS last_content,
+           (SELECT created_at FROM events e WHERE e.conversation_id = c.id ORDER BY e.created_at DESC LIMIT 1) AS last_event_created
+    FROM conversations c JOIN leads l ON l.id = c.lead_id
+    ORDER BY COALESCE(c.last_event_at, c.created_at) DESC
+  `)).rows;
+  rows = rows.map(enrichSla);
+  if (status) rows = rows.filter((r) => r.status === status);
+  if (sla) rows = rows.filter((r) => r.sla_status === sla);
+  return c.json(rows);
+});
+router5.get("/:id", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const conv = (await db.execute({
+    sql: `SELECT c.*, l.name AS lead_name, l.company, l.city, l.phone, l.email, l.source, l.status AS lead_status
+          FROM conversations c JOIN leads l ON l.id = c.lead_id WHERE c.id = ?`,
+    args: [c.req.param("id")]
+  })).rows[0];
+  if (!conv) return c.json({ error: "Conversation not found" }, 404);
+  const events = (await db.execute({
+    sql: `SELECT id, type, channel, direction, content, handled_by, action, summary, source_ref, metadata, created_at
+          FROM events WHERE conversation_id = ? ORDER BY created_at ASC`,
+    args: [conv.id]
+  })).rows;
+  return c.json({ conversation: enrichSla(conv), events });
+});
+router5.post("/:id/events", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const d = z5.object({ content: z5.string().min(1), handled_by: z5.enum(["human", "ai"]).optional() }).parse(await c.req.json());
+  const db = await getDb();
+  const conv = (await db.execute({ sql: "SELECT lead_id FROM conversations WHERE id = ?", args: [c.req.param("id")] })).rows[0];
+  if (!conv) return c.json({ error: "Conversation not found" }, 404);
+  await insertEvent(db, {
+    lead_id: conv.lead_id,
+    channel: "note",
+    type: "note",
+    direction: "internal",
+    handled_by: d.handled_by ?? "human",
+    action: "note",
+    summary: d.content.slice(0, 120),
+    content: d.content,
+    metadata: { note: true }
+  });
+  return c.json({ success: true });
+});
+router5.post("/:id/status", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const d = z5.object({ status: z5.enum(["new", "active", "awaiting_reply", "resolved", "archived"]) }).parse(await c.req.json());
+  const db = await getDb();
+  await setConversationStatus(db, c.req.param("id"), d.status);
+  return c.json({ success: true });
+});
+var conversations_default = router5;
+
+// src/routes/whatsapp-webhook.ts
+import { Hono as Hono6 } from "hono";
+var ACK_DEBOUNCE_MS = 5 * 60 * 1e3;
+var router6 = new Hono6();
+router6.get("/", (c) => {
   const mode = c.req.query("hub.mode");
   const token = c.req.query("hub.verify_token");
   const challenge = c.req.query("hub.challenge");
@@ -1071,7 +1355,7 @@ router5.get("/", (c) => {
   if (!ok) return c.text("Verification failed", 403);
   return c.text(ch ?? "");
 });
-router5.post("/", async (c) => {
+router6.post("/", async (c) => {
   const authHeader = c.req.header("x-webhook-secret") ?? c.req.header("x-hub-signature-256");
   if (!await authorizeWebhook(authHeader)) {
     return c.json({ error: "Unauthorized" }, 401);
@@ -1111,8 +1395,12 @@ router5.post("/", async (c) => {
     await insertEvent(db, {
       lead_id: leadId,
       channel: "whatsapp",
+      type: "whatsapp",
+      direction: "inbound",
+      handled_by: "unhandled",
       action: "received",
       summary: msg.body.slice(0, 120),
+      content: msg.body,
       source_ref: msg.providerMessageId,
       metadata: { from: msg.from, to: cfg.fromNumber || null, message_type: msg.messageType },
       created_at: now
@@ -1173,19 +1461,23 @@ async function maybeAutoAck(db, msg, inboundId, fromNumber) {
   await insertEvent(db, {
     lead_id: null,
     channel: "whatsapp",
+    type: "whatsapp",
+    direction: "outbound",
+    handled_by: "human",
     action: "auto-acknowledged",
     summary: autoAckText().slice(0, 120),
+    content: autoAckText(),
     source_ref: inboundId,
     metadata: { to: msg.from, provider_message_id: send.providerMessageId, off_hours: true },
     created_at: now
   });
   return send.ok;
 }
-var whatsapp_webhook_default = router5;
+var whatsapp_webhook_default = router6;
 
 // src/index.ts
 var extraOrigins = (process.env.CORS_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-var app = new Hono6();
+var app = new Hono7();
 app.use("/*", cors({
   origin: [
     "http://localhost:5173",
@@ -1199,6 +1491,7 @@ app.route("/api/auth", auth_default);
 app.route("/api/leads", leads_default);
 app.route("/api/messages", messages_default);
 app.route("/api/ai", ai_default);
+app.route("/api/conversations", conversations_default);
 app.route("/api/webhooks/whatsapp", whatsapp_webhook_default);
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 var index_default = app;
