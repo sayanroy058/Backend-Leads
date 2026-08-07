@@ -133,6 +133,16 @@ const EMAIL_MESSAGE_MIGRATIONS = [
   `ALTER TABLE email_messages ADD COLUMN labels TEXT`,
 ];
 
+// Phase 2 — WhatsApp: direction, participant numbers, provider dedupe id, and
+// the timestamp we auto-acknowledged an off-hours inbound message (if any).
+const WHATSAPP_MESSAGE_MIGRATIONS = [
+  `ALTER TABLE whatsapp_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN from_number TEXT`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN to_number TEXT`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN provider_message_id TEXT`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN acknowledged_at TEXT`,
+];
+
 // Hardcoded demo account so login works out of the box.
 //   email:    testuser@gmail.com
 //   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
@@ -156,7 +166,7 @@ async function initDb(c: Client) {
 
   // Column migrations run individually — ALTER TABLE cannot be batched with
   // a guaranteed outcome, and duplicate-column errors are expected once applied.
-  for (const sql of EMAIL_MESSAGE_MIGRATIONS) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
@@ -175,7 +185,9 @@ async function initDb(c: Client) {
   `);
   await c.execute(`
     INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
-    SELECT 'evt-' || id, lead_id, 'whatsapp', COALESCE(status, 'sent'), NULL, id, created_at
+    SELECT 'evt-' || id, lead_id, 'whatsapp',
+           CASE WHEN direction = 'inbound' THEN 'received' ELSE COALESCE(status, 'sent') END,
+           body, id, created_at
     FROM whatsapp_messages
   `);
   await c.execute(`

@@ -1,6 +1,6 @@
 // src/index.ts
 import { serve } from "@hono/node-server";
-import { Hono as Hono5 } from "hono";
+import { Hono as Hono6 } from "hono";
 import { cors } from "hono/cors";
 
 // src/routes/auth.ts
@@ -112,7 +112,19 @@ var TABLE_DDL = [
     content TEXT NOT NULL,
     citations TEXT,
     created_at TEXT DEFAULT (datetime('now'))
-  )`
+  )`,
+  `CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT,
+    channel TEXT NOT NULL CHECK(channel IN ('email','whatsapp','call')),
+    action TEXT NOT NULL,
+    summary TEXT,
+    source_ref TEXT,
+    metadata TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`
 ];
 var EMAIL_MESSAGE_MIGRATIONS = [
   `ALTER TABLE email_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
@@ -121,6 +133,13 @@ var EMAIL_MESSAGE_MIGRATIONS = [
   `ALTER TABLE email_messages ADD COLUMN agentmail_message_id TEXT`,
   `ALTER TABLE email_messages ADD COLUMN agentmail_thread_id TEXT`,
   `ALTER TABLE email_messages ADD COLUMN labels TEXT`
+];
+var WHATSAPP_MESSAGE_MIGRATIONS = [
+  `ALTER TABLE whatsapp_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN from_number TEXT`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN to_number TEXT`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN provider_message_id TEXT`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN acknowledged_at TEXT`
 ];
 var DEMO_USER_HASH = "$2b$10$/ixfDGIckZ5KISPFS5y7puGhS4MGJkUJHkrdgDMG.si2aBQtWHy2u";
 async function initDb(c) {
@@ -134,12 +153,31 @@ async function initDb(c) {
     ],
     "write"
   );
-  for (const sql of EMAIL_MESSAGE_MIGRATIONS) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
     }
   }
+  await c.execute(`
+    INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
+    SELECT 'evt-' || id, lead_id, 'email',
+           CASE WHEN direction = 'inbound' THEN 'received' ELSE COALESCE(status, 'sent') END,
+           subject, id, created_at
+    FROM email_messages
+  `);
+  await c.execute(`
+    INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
+    SELECT 'evt-' || id, lead_id, 'whatsapp',
+           CASE WHEN direction = 'inbound' THEN 'received' ELSE COALESCE(status, 'sent') END,
+           body, id, created_at
+    FROM whatsapp_messages
+  `);
+  await c.execute(`
+    INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
+    SELECT 'evt-' || id, lead_id, 'call', COALESCE(status, 'pending'), goal, id, created_at
+    FROM call_logs
+  `);
 }
 async function getDb() {
   const c = getClient();
@@ -335,15 +373,14 @@ router2.get("/activity/feed", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const db = await getDb();
-  const emails = (await db.execute("SELECT id, subject, status, created_at FROM email_messages ORDER BY created_at DESC LIMIT 20")).rows;
-  const was = (await db.execute("SELECT id, status, created_at FROM whatsapp_messages ORDER BY created_at DESC LIMIT 20")).rows;
-  const calls = (await db.execute("SELECT id, status, outcome, created_at FROM call_logs ORDER BY created_at DESC LIMIT 20")).rows;
-  const items = [
-    ...emails.map((e) => ({ id: `e-${e.id}`, type: "email", text: `Email "${e.subject}" \u2014 ${e.status}`, when: e.created_at })),
-    ...was.map((e) => ({ id: `w-${e.id}`, type: "whatsapp", text: `WhatsApp message \u2014 ${e.status}`, when: e.created_at })),
-    ...calls.map((e) => ({ id: `c-${e.id}`, type: "call", text: `Call \u2014 ${e.status}${e.outcome ? ` \xB7 ${e.outcome}` : ""}`, when: e.created_at }))
-  ].sort((a, b) => +new Date(b.when) - +new Date(a.when)).slice(0, 8);
-  return c.json(items);
+  const rows = (await db.execute("SELECT id, channel, action, summary, created_at FROM events ORDER BY created_at DESC LIMIT 20")).rows;
+  const items = rows.map((e) => ({
+    id: e.id,
+    type: e.channel,
+    text: e.channel === "email" ? `Email "${e.summary ?? ""}" \u2014 ${e.action}` : e.channel === "whatsapp" ? `WhatsApp message \u2014 ${e.action}` : `Call \u2014 ${e.action}`,
+    when: e.created_at
+  }));
+  return c.json(items.slice(0, 8));
 });
 router2.get("/:id", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
@@ -430,6 +467,161 @@ async function getMessage(messageId) {
   return agentmailFetch(`/inboxes/${encodeURIComponent(inbox)}/messages/${encodeURIComponent(messageId)}`);
 }
 
+// src/lib/events.ts
+async function insertEvent(db, e) {
+  await db.execute({
+    sql: "INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    args: [
+      crypto.randomUUID(),
+      e.lead_id ?? null,
+      e.channel,
+      e.action,
+      e.summary ?? null,
+      e.source_ref ?? null,
+      e.metadata !== void 0 ? JSON.stringify(e.metadata) : null,
+      e.created_at ?? (/* @__PURE__ */ new Date()).toISOString()
+    ]
+  });
+}
+
+// src/lib/whatsapp.ts
+var DEFAULT_GRAPH = "https://graph.facebook.com/v21.0";
+function env(name) {
+  return (process.env[name] ?? "").trim();
+}
+function whatsappConfig() {
+  return {
+    enabled: Boolean(env("WHATSAPP_API_TOKEN") && env("WHATSAPP_PHONE_ID")),
+    base: (env("WHATSAPP_API_BASE") || DEFAULT_GRAPH).replace(/\/+$/, ""),
+    token: env("WHATSAPP_API_TOKEN"),
+    phoneId: env("WHATSAPP_PHONE_ID"),
+    fromNumber: env("WHATSAPP_FROM_NUMBER"),
+    verifyToken: env("WHATSAPP_WEBHOOK_VERIFY_TOKEN"),
+    webhookSecret: env("WHATSAPP_WEBHOOK_SECRET")
+  };
+}
+function normalizePhone(raw) {
+  return (raw ?? "").replace(/[^\d]/g, "");
+}
+function phoneMatches(a, b) {
+  const na = normalizePhone(a);
+  const nb = normalizePhone(b);
+  if (!na || !nb) return false;
+  const len = Math.min(10, Math.min(na.length, nb.length));
+  if (len === 0) return false;
+  return na.slice(-len) === nb.slice(-len);
+}
+function verifyHandshake(mode, token, challenge) {
+  const cfg = whatsappConfig();
+  if (mode === "subscribe" && token && cfg.verifyToken && token === cfg.verifyToken && challenge) {
+    return { ok: true, challenge };
+  }
+  return { ok: false, challenge: null };
+}
+async function authorizeWebhook(headerValue) {
+  const cfg = whatsappConfig();
+  if (!cfg.webhookSecret) return true;
+  if (!headerValue) return false;
+  return headerValue === cfg.webhookSecret;
+}
+function normalizeInbound(body) {
+  const out = [];
+  if (!body || typeof body !== "object") return out;
+  const messages = [];
+  const contacts = [];
+  if (Array.isArray(body?.entry)) {
+    for (const entry of body.entry) {
+      for (const change of entry?.changes ?? []) {
+        const value = change?.value;
+        if (Array.isArray(value?.messages)) messages.push(...value.messages);
+        if (Array.isArray(value?.contacts)) contacts.push(...value.contacts);
+      }
+    }
+  } else if (Array.isArray(body?.messages)) {
+    messages.push(...body.messages);
+    if (Array.isArray(body?.contacts)) contacts.push(...body.contacts);
+  }
+  const contactByWa = /* @__PURE__ */ new Map();
+  for (const c of contacts) {
+    if (c?.wa_id) contactByWa.set(String(c.wa_id), c?.profile?.name ?? null);
+  }
+  for (const m of messages) {
+    if (m?.type !== "text") continue;
+    const from = String(m.from ?? "").replace(/[^\d]/g, "");
+    const body2 = (m?.text?.body ?? "").toString();
+    if (!from || !body2) continue;
+    const tsNum = Number(m.timestamp);
+    out.push({
+      from,
+      contactName: contactByWa.get(from) ?? null,
+      body: body2,
+      providerMessageId: String(m.id ?? `${from}-${m.timestamp}-${body2.slice(0, 16)}`),
+      timestamp: Number.isFinite(tsNum) ? new Date(tsNum * 1e3).toISOString() : (/* @__PURE__ */ new Date()).toISOString(),
+      messageType: "text"
+    });
+  }
+  return out;
+}
+async function sendText(to, text) {
+  const cfg = whatsappConfig();
+  if (!cfg.enabled) return { ok: false, providerMessageId: null, error: "WhatsApp provider is not configured (WHATSAPP_API_TOKEN / WHATSAPP_PHONE_ID)" };
+  if (!cfg.phoneId) return { ok: false, providerMessageId: null, error: "WHATSAPP_PHONE_ID is not set" };
+  const url = `${cfg.base}/${encodeURIComponent(cfg.phoneId)}/messages`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.token}`
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: normalizePhone(to),
+        type: "text",
+        text: { body: text }
+      })
+    });
+  } catch (e) {
+    return { ok: false, providerMessageId: null, error: `WhatsApp provider unreachable: ${e.message}` };
+  }
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    return { ok: false, providerMessageId: null, error: `WhatsApp send failed (${res.status}): ${detail.slice(0, 500)}` };
+  }
+  const json = await res.json().catch(() => ({}));
+  return { ok: true, providerMessageId: json?.messages?.[0]?.id ?? null };
+}
+function workingHoursConfig() {
+  return {
+    start: env("WHATSAPP_WORKING_HOURS_START") || "09:00",
+    // 24h "HH:MM"
+    end: env("WHATSAPP_WORKING_HOURS_END") || "18:00",
+    tz: env("WHATSAPP_WORKING_TZ") || "America/New_York"
+  };
+}
+function isWithinWorkingHours(date) {
+  const { start, end, tz } = workingHoursConfig();
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  });
+  const parts = fmt.formatToParts(date);
+  const get = (t) => parts.find((p) => p.type === t)?.value ?? "0";
+  const mins = Number(get("hour")) * 60 + Number(get("minute"));
+  const [sh, sm] = start.split(":").map(Number);
+  const [eh, em] = end.split(":").map(Number);
+  const s = sh * 60 + (sm || 0);
+  const e = eh * 60 + (em || 0);
+  return mins >= s && mins < e;
+}
+function autoAckText() {
+  return "Thanks for reaching out \u2014 we got your message. Our team will get back to you shortly. \u{1F64C}";
+}
+
 // src/routes/messages.ts
 var router3 = new Hono3();
 router3.get("/chat", async (c) => {
@@ -503,6 +695,15 @@ router3.post("/emails/send", async (c) => {
       args: [now, inbox, lead.email, sent.message_id ?? null, sent.thread_id ?? null, id]
     });
     await db.execute({ sql: "UPDATE leads SET status = 'contacted', last_activity = ? WHERE id = ?", args: [now, row.lead_id] });
+    await insertEvent(db, {
+      lead_id: row.lead_id,
+      channel: "email",
+      action: "sent",
+      summary: row.subject,
+      source_ref: id,
+      metadata: { message_id: sent.message_id ?? null, thread_id: sent.thread_id ?? null, to: lead.email },
+      created_at: now
+    });
     const updated = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0];
     return c.json(updated);
   } catch (e) {
@@ -536,11 +737,33 @@ router3.post("/emails/sync", async (c) => {
     let leadId = null;
     if (fromEmail) {
       const lead = (await db.execute({ sql: "SELECT id FROM leads WHERE email = ?", args: [fromEmail] })).rows[0];
-      if (lead) leadId = lead.id;
+      if (lead) {
+        leadId = lead.id;
+      } else {
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const newId = crypto.randomUUID();
+        const name = extractName(full.from) ?? fromEmail;
+        await db.execute({
+          sql: "INSERT INTO leads (id, name, email, source, status, score, last_activity, created_at) VALUES (?, ?, ?, 'inbound email', 'new', ?, ?, ?)",
+          args: [newId, name, fromEmail, computeLeadScore({ email: fromEmail, name }), now, now]
+        });
+        leadId = newId;
+      }
     }
+    const emailRowId = crypto.randomUUID();
+    const emailCreatedAt = full.timestamp ?? (/* @__PURE__ */ new Date()).toISOString();
     await db.execute({
       sql: "INSERT INTO email_messages (id, lead_id, subject, body, direction, status, from_email, to_email, agentmail_message_id, agentmail_thread_id, created_at) VALUES (?, ?, ?, ?, 'inbound', 'received', ?, ?, ?, ?, ?)",
-      args: [crypto.randomUUID(), leadId, full.subject ?? null, body, fromEmail, toEmail, full.message_id, full.thread_id ?? null, full.timestamp ?? (/* @__PURE__ */ new Date()).toISOString()]
+      args: [emailRowId, leadId, full.subject ?? null, body, fromEmail, toEmail, full.message_id, full.thread_id ?? null, emailCreatedAt]
+    });
+    await insertEvent(db, {
+      lead_id: leadId,
+      channel: "email",
+      action: "received",
+      summary: full.subject ?? "(no subject)",
+      source_ref: emailRowId,
+      metadata: { from: fromEmail, message_id: full.message_id },
+      created_at: emailCreatedAt
     });
     synced++;
   }
@@ -551,6 +774,11 @@ function extractEmail(from) {
   const s = String(from).trim();
   const m = s.match(/<([^<>]+)>/);
   return (m ? m[1] : s) || null;
+}
+function extractName(from) {
+  if (!from) return null;
+  const m = String(from).trim().match(/^(.*?)\s*<[^<>]+>$/);
+  return m && m[1].trim() ? m[1].trim() : null;
 }
 function stripHtml(html) {
   if (!html) return null;
@@ -565,10 +793,14 @@ router3.post("/whatsapps", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
   const data = z3.array(z3.object({ lead_id: z3.string(), body: z3.string(), status: z3.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  const statements = data.map((r) => ({
-    sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)",
-    args: [crypto.randomUUID(), r.lead_id, r.body, r.status ?? "draft"]
-  }));
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const statements = data.flatMap((r) => {
+    const id = crypto.randomUUID();
+    return [
+      { sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)", args: [id, r.lead_id, r.body, r.status ?? "draft"] },
+      { sql: "INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'whatsapp', ?, ?, ?, ?)", args: [crypto.randomUUID(), r.lead_id, r.status ?? "draft", r.body.slice(0, 120), id, now] }
+    ];
+  });
   if (statements.length) await db.batch(statements, "write");
   return c.json({ success: true });
 });
@@ -592,7 +824,59 @@ router3.post("/whatsapps/status", async (c) => {
   }
   vals.push(d.id);
   await db.execute({ sql: `UPDATE whatsapp_messages SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  const w = (await db.execute({ sql: "SELECT lead_id FROM whatsapp_messages WHERE id = ?", args: [d.id] })).rows[0];
+  await insertEvent(db, { lead_id: w?.lead_id ?? null, channel: "whatsapp", action: d.status, source_ref: d.id });
   return c.json({ success: true });
+});
+router3.post("/whatsapps/send", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const d = z3.object({ id: z3.string().optional(), lead_id: z3.string().optional(), body: z3.string().optional() }).parse(await c.req.json());
+  const db = await getDb();
+  let messageId = d.id ?? "";
+  let leadId = d.lead_id ?? null;
+  let body = d.body ?? "";
+  let fromNumber = null;
+  if (!messageId && (leadId && body)) {
+    const cfg = whatsappConfig();
+    const newId = crypto.randomUUID();
+    const lead2 = (await db.execute({ sql: "SELECT phone FROM leads WHERE id = ?", args: [leadId] })).rows[0];
+    if (!lead2?.phone) return c.json({ error: "Lead has no phone number \u2014 add one before sending" }, 400);
+    await db.execute({
+      sql: "INSERT INTO whatsapp_messages (id, lead_id, body, direction, from_number, to_number, status) VALUES (?, ?, ?, 'outbound', ?, ?, 'draft')",
+      args: [newId, leadId, body, cfg.fromNumber || null, lead2.phone]
+    });
+    messageId = newId;
+    fromNumber = cfg.fromNumber || null;
+  } else if (messageId) {
+    const row = (await db.execute({ sql: "SELECT * FROM whatsapp_messages WHERE id = ?", args: [messageId] })).rows[0];
+    if (!row) return c.json({ error: "WhatsApp message not found" }, 404);
+    leadId = row.lead_id;
+    body = row.body;
+    fromNumber = row.from_number ?? whatsappConfig().fromNumber ?? null;
+  }
+  if (!leadId) return c.json({ error: "Message is not linked to a lead" }, 400);
+  if (!body) return c.json({ error: "Nothing to send \u2014 message body is empty" }, 400);
+  const lead = (await db.execute({ sql: "SELECT phone FROM leads WHERE id = ?", args: [leadId] })).rows[0];
+  if (!lead?.phone) return c.json({ error: "Lead has no phone number \u2014 add one before sending" }, 400);
+  const send = await sendText(lead.phone, body);
+  if (!send.ok) return c.json({ error: send.error ?? "WhatsApp send failed" }, 502);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await db.execute({
+    sql: "UPDATE whatsapp_messages SET status = 'sent', sent_at = ?, provider_message_id = ?, to_number = ?, from_number = ?, direction = 'outbound' WHERE id = ?",
+    args: [now, send.providerMessageId, lead.phone, fromNumber, messageId]
+  });
+  await db.execute({ sql: "UPDATE leads SET status = 'contacted', last_activity = ? WHERE id = ?", args: [now, leadId] });
+  await insertEvent(db, {
+    lead_id: leadId,
+    channel: "whatsapp",
+    action: "sent",
+    summary: body.slice(0, 120),
+    source_ref: messageId,
+    metadata: { to: lead.phone, provider_message_id: send.providerMessageId, from: fromNumber },
+    created_at: now
+  });
+  const updated = (await db.execute({ sql: "SELECT * FROM whatsapp_messages WHERE id = ?", args: [messageId] })).rows[0];
+  return c.json(updated);
 });
 router3.get("/calls", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
@@ -603,10 +887,14 @@ router3.post("/calls", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
   const data = z3.array(z3.object({ lead_id: z3.string(), goal: z3.string().optional(), voice: z3.string().optional(), status: z3.string().optional() })).parse(await c.req.json());
   const db = await getDb();
-  const statements = data.map((r) => ({
-    sql: "INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)",
-    args: [crypto.randomUUID(), r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"]
-  }));
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const statements = data.flatMap((r) => {
+    const id = crypto.randomUUID();
+    return [
+      { sql: "INSERT INTO call_logs (id, lead_id, goal, voice, status) VALUES (?, ?, ?, ?, ?)", args: [id, r.lead_id, r.goal ?? null, r.voice ?? null, r.status ?? "queued"] },
+      { sql: "INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'call', ?, ?, ?, ?)", args: [crypto.randomUUID(), r.lead_id, r.status ?? "queued", r.goal ?? null, id, now] }
+    ];
+  });
   if (statements.length) await db.batch(statements, "write");
   const rows = (await db.execute("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 50")).rows;
   return c.json(rows);
@@ -648,6 +936,8 @@ router3.post("/calls/status", async (c) => {
   if (!sets.length) return c.json({ success: true });
   vals.push(d.id);
   await db.execute({ sql: `UPDATE call_logs SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  const cl = (await db.execute({ sql: "SELECT lead_id FROM call_logs WHERE id = ?", args: [d.id] })).rows[0];
+  await insertEvent(db, { lead_id: cl?.lead_id ?? null, channel: "call", action: d.outcome ?? d.status ?? "updated", source_ref: d.id });
   return c.json({ success: true });
 });
 router3.get("/appointments", async (c) => {
@@ -769,9 +1059,133 @@ router4.post("/image", async (c) => {
 });
 var ai_default = router4;
 
+// src/routes/whatsapp-webhook.ts
+import { Hono as Hono5 } from "hono";
+var ACK_DEBOUNCE_MS = 5 * 60 * 1e3;
+var router5 = new Hono5();
+router5.get("/", (c) => {
+  const mode = c.req.query("hub.mode");
+  const token = c.req.query("hub.verify_token");
+  const challenge = c.req.query("hub.challenge");
+  const { ok, challenge: ch } = verifyHandshake(mode, token, challenge);
+  if (!ok) return c.text("Verification failed", 403);
+  return c.text(ch ?? "");
+});
+router5.post("/", async (c) => {
+  const authHeader = c.req.header("x-webhook-secret") ?? c.req.header("x-hub-signature-256");
+  if (!await authorizeWebhook(authHeader)) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  const body = await c.req.json().catch(() => ({}));
+  if (body?.object === "whatsapp_business_account") {
+    return c.json({ status: "ok" });
+  }
+  const inbound = normalizeInbound(body);
+  if (!inbound.length) return c.json({ status: "ok", received: 0 });
+  const db = await getDb();
+  const cfg = whatsappConfig();
+  let receivedCount = 0;
+  for (const msg of inbound) {
+    const dup = (await db.execute({
+      sql: "SELECT id FROM whatsapp_messages WHERE provider_message_id = ? LIMIT 1",
+      args: [msg.providerMessageId]
+    })).rows[0];
+    if (dup) continue;
+    const leadId = await findOrCreateLead(db, msg);
+    const now = msg.timestamp || (/* @__PURE__ */ new Date()).toISOString();
+    const inboundId = crypto.randomUUID();
+    await db.execute({
+      sql: `INSERT INTO whatsapp_messages
+        (id, lead_id, body, direction, from_number, to_number, provider_message_id, status, created_at)
+        VALUES (?, ?, ?, 'inbound', ?, ?, ?, 'received', ?)`,
+      args: [
+        inboundId,
+        leadId,
+        msg.body,
+        msg.from,
+        cfg.fromNumber || null,
+        msg.providerMessageId,
+        now
+      ]
+    });
+    await insertEvent(db, {
+      lead_id: leadId,
+      channel: "whatsapp",
+      action: "received",
+      summary: msg.body.slice(0, 120),
+      source_ref: msg.providerMessageId,
+      metadata: { from: msg.from, to: cfg.fromNumber || null, message_type: msg.messageType },
+      created_at: now
+    });
+    let acknowledged = false;
+    if (!isWithinWorkingHours(/* @__PURE__ */ new Date())) {
+      acknowledged = await maybeAutoAck(db, msg, inboundId, cfg.fromNumber);
+    }
+    if (acknowledged) {
+      await db.execute({
+        sql: "UPDATE whatsapp_messages SET acknowledged_at = ? WHERE id = ?",
+        args: [(/* @__PURE__ */ new Date()).toISOString(), inboundId]
+      });
+    }
+    receivedCount++;
+  }
+  return c.json({ status: "ok", received: receivedCount });
+});
+async function findOrCreateLead(db, msg) {
+  const rows = (await db.execute("SELECT id, phone FROM leads WHERE phone IS NOT NULL AND phone != ''")).rows;
+  for (const r of rows) {
+    if (phoneMatches(r.phone, msg.from)) return r.id;
+  }
+  const id = crypto.randomUUID();
+  const name = msg.contactName?.trim() || msg.from;
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await db.execute({
+    sql: `INSERT INTO leads (id, name, phone, source, status, score, last_activity, created_at)
+      VALUES (?, ?, ?, 'whatsapp inbound', 'new', 0, ?, ?)`,
+    args: [id, name, normalizePhone(msg.from), now, now]
+  });
+  return id;
+}
+async function maybeAutoAck(db, msg, inboundId, fromNumber) {
+  if (!fromNumber) return false;
+  const recent = (await db.execute({
+    sql: `SELECT id FROM whatsapp_messages
+        WHERE direction = 'outbound' AND to_number = ? AND created_at >= ?
+        ORDER BY created_at DESC LIMIT 1`,
+    args: [msg.from, new Date(Date.now() - ACK_DEBOUNCE_MS).toISOString()]
+  })).rows[0];
+  if (recent) return false;
+  const send = await sendText(msg.from, autoAckText());
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await db.execute({
+    sql: `INSERT INTO whatsapp_messages
+      (id, lead_id, body, direction, from_number, to_number, provider_message_id, status, created_at)
+      VALUES (?, NULL, ?, 'outbound', ?, ?, ?, 'sent', ?)`,
+    args: [
+      crypto.randomUUID(),
+      autoAckText(),
+      fromNumber,
+      normalizePhone(msg.from),
+      send.providerMessageId,
+      now
+    ]
+  });
+  await insertEvent(db, {
+    lead_id: null,
+    channel: "whatsapp",
+    action: "auto-acknowledged",
+    summary: autoAckText().slice(0, 120),
+    source_ref: inboundId,
+    metadata: { to: msg.from, provider_message_id: send.providerMessageId, off_hours: true },
+    created_at: now
+  });
+  return send.ok;
+}
+var whatsapp_webhook_default = router5;
+
 // src/index.ts
 var extraOrigins = (process.env.CORS_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-var app = new Hono5();
+var app = new Hono6();
 app.use("/*", cors({
   origin: [
     "http://localhost:5173",
@@ -785,6 +1199,7 @@ app.route("/api/auth", auth_default);
 app.route("/api/leads", leads_default);
 app.route("/api/messages", messages_default);
 app.route("/api/ai", ai_default);
+app.route("/api/webhooks/whatsapp", whatsapp_webhook_default);
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 var index_default = app;
 if (process.env.NODE_ENV !== "production") {

@@ -6,6 +6,7 @@ import { authenticate } from "../middleware/auth";
 import { sendMessage, listMessages, getMessage } from "../lib/agentmail";
 import { insertEvent } from "../lib/events";
 import { computeLeadScore } from "./leads";
+import { sendText, whatsappConfig } from "../lib/whatsapp";
 
 const router = new Hono();
 
@@ -225,6 +226,69 @@ router.post("/whatsapps/status", async (c) => {
   const w = (await db.execute({ sql: "SELECT lead_id FROM whatsapp_messages WHERE id = ?", args: [d.id] })).rows[0] as unknown as { lead_id: string | null } | undefined;
   await insertEvent(db, { lead_id: w?.lead_id ?? null, channel: "whatsapp", action: d.status, source_ref: d.id });
   return c.json({ success: true });
+});
+
+// Actually send a WhatsApp message through the provider. Accepts an existing
+// draft `id`, or a raw `{ lead_id, body }` (convenience for a single send).
+router.post("/whatsapps/send", async (c) => {
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const d = z.object({ id: z.string().optional(), lead_id: z.string().optional(), body: z.string().optional() }).parse(await c.req.json());
+  const db = await getDb();
+
+  let messageId = d.id ?? "";
+  let leadId: string | null = d.lead_id ?? null;
+  let body = d.body ?? "";
+  let fromNumber: string | null = null;
+
+  if (!messageId && (leadId && body)) {
+    // One-off send: create the outbound row first.
+    const cfg = whatsappConfig();
+    const newId = crypto.randomUUID();
+    const lead = (await db.execute({ sql: "SELECT phone FROM leads WHERE id = ?", args: [leadId] })).rows[0] as unknown as { phone: string | null } | undefined;
+    if (!lead?.phone) return c.json({ error: "Lead has no phone number — add one before sending" }, 400);
+    await db.execute({
+      sql: "INSERT INTO whatsapp_messages (id, lead_id, body, direction, from_number, to_number, status) VALUES (?, ?, ?, 'outbound', ?, ?, 'draft')",
+      args: [newId, leadId, body, cfg.fromNumber || null, lead.phone],
+    });
+    messageId = newId;
+    fromNumber = cfg.fromNumber || null;
+  } else if (messageId) {
+    // Existing row — read it back for the lead + body + sending number.
+    const row = (await db.execute({ sql: "SELECT * FROM whatsapp_messages WHERE id = ?", args: [messageId] })).rows[0] as unknown as
+      | { lead_id: string | null; body: string; from_number: string | null }
+      | undefined;
+    if (!row) return c.json({ error: "WhatsApp message not found" }, 404);
+    leadId = row.lead_id;
+    body = row.body;
+    fromNumber = row.from_number ?? whatsappConfig().fromNumber ?? null;
+  }
+
+  if (!leadId) return c.json({ error: "Message is not linked to a lead" }, 400);
+  if (!body) return c.json({ error: "Nothing to send — message body is empty" }, 400);
+
+  const lead = (await db.execute({ sql: "SELECT phone FROM leads WHERE id = ?", args: [leadId] })).rows[0] as unknown as { phone: string | null } | undefined;
+  if (!lead?.phone) return c.json({ error: "Lead has no phone number — add one before sending" }, 400);
+
+  const send = await sendText(lead.phone, body);
+  if (!send.ok) return c.json({ error: send.error ?? "WhatsApp send failed" }, 502);
+
+  const now = new Date().toISOString();
+  await db.execute({
+    sql: "UPDATE whatsapp_messages SET status = 'sent', sent_at = ?, provider_message_id = ?, to_number = ?, from_number = ?, direction = 'outbound' WHERE id = ?",
+    args: [now, send.providerMessageId, lead.phone, fromNumber, messageId],
+  });
+  await db.execute({ sql: "UPDATE leads SET status = 'contacted', last_activity = ? WHERE id = ?", args: [now, leadId] });
+  await insertEvent(db, {
+    lead_id: leadId,
+    channel: "whatsapp",
+    action: "sent",
+    summary: body.slice(0, 120),
+    source_ref: messageId,
+    metadata: { to: lead.phone, provider_message_id: send.providerMessageId, from: fromNumber },
+    created_at: now,
+  });
+  const updated = (await db.execute({ sql: "SELECT * FROM whatsapp_messages WHERE id = ?", args: [messageId] })).rows[0];
+  return c.json(updated);
 });
 
 // ---- Calls ----
