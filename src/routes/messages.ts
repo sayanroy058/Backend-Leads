@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { InStatement } from "@libsql/client";
 import { getDb } from "../db";
 import { authenticate } from "../middleware/auth";
-import { sendMessage, listMessages, getMessage } from "../lib/agentmail";
+import { sendMessage, listMessages, getMessage } from "../lib/mailer";
 import { insertEvent } from "../lib/events";
 import { computeLeadScore } from "./leads";
 import { sendText, whatsappConfig } from "../lib/whatsapp";
@@ -60,7 +60,7 @@ router.post("/emails/status", async (c) => {
   return c.json({ success: true });
 });
 
-// Actually send an email draft through AgentMail (leads-test@agentmail.to).
+// Actually send an email draft through Gmail SMTP.
 router.post("/emails/send", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const { id } = z.object({ id: z.string() }).parse(await c.req.json());
@@ -76,7 +76,7 @@ router.post("/emails/send", async (c) => {
   if (!lead?.email) return c.json({ error: "Lead has no email address — add one before sending" }, 400);
   try {
     const sent = await sendMessage({ to: lead.email, subject: row.subject, text: row.body });
-    const inbox = process.env.AGENTMAIL_INBOX ?? "";
+    const inbox = process.env.GMAIL_USER ?? "";
     const now = new Date().toISOString();
     await db.execute({
       sql: "UPDATE email_messages SET status = 'sent', sent_at = ?, from_email = ?, to_email = ?, agentmail_message_id = ?, agentmail_thread_id = ? WHERE id = ?",
@@ -103,7 +103,7 @@ router.post("/emails/send", async (c) => {
   }
 });
 
-// Pull the latest inbound mail from the AgentMail inbox into email_messages.
+// Pull the latest inbound mail from the Gmail inbox into email_messages.
 router.post("/emails/sync", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const db = await getDb();

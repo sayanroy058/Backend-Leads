@@ -43,5 +43,5 @@ if (process.env.NODE_ENV !== "production") {
   console.log(`Backend running on http://localhost:${port}`);
   serve({ fetch: app.fetch, port });
 } else {
-  console.log("Leadflow backend in serverless mode — no listener started.");
+  console.log("GradLead AI backend in serverless mode — no listener started.");
 }

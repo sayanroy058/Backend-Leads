@@ -151,6 +151,9 @@ const EMAIL_MESSAGE_MIGRATIONS = [
   `ALTER TABLE email_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
   `ALTER TABLE email_messages ADD COLUMN from_email TEXT`,
   `ALTER TABLE email_messages ADD COLUMN to_email TEXT`,
+  // Column names kept from the original AgentMail integration (now Gmail
+  // SMTP/IMAP, see lib/mailer.ts) to avoid a data migration — they hold the
+  // provider message/thread id regardless of which mail provider wrote them.
   `ALTER TABLE email_messages ADD COLUMN agentmail_message_id TEXT`,
   `ALTER TABLE email_messages ADD COLUMN agentmail_thread_id TEXT`,
   `ALTER TABLE email_messages ADD COLUMN labels TEXT`,

@@ -214,6 +214,9 @@ var EMAIL_MESSAGE_MIGRATIONS = [
   `ALTER TABLE email_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
   `ALTER TABLE email_messages ADD COLUMN from_email TEXT`,
   `ALTER TABLE email_messages ADD COLUMN to_email TEXT`,
+  // Column names kept from the original AgentMail integration (now Gmail
+  // SMTP/IMAP, see lib/mailer.ts) to avoid a data migration — they hold the
+  // provider message/thread id regardless of which mail provider wrote them.
   `ALTER TABLE email_messages ADD COLUMN agentmail_message_id TEXT`,
   `ALTER TABLE email_messages ADD COLUMN agentmail_thread_id TEXT`,
   `ALTER TABLE email_messages ADD COLUMN labels TEXT`
@@ -594,53 +597,140 @@ router2.delete("/:id", async (c) => {
   await (await getDb()).execute({ sql: "DELETE FROM leads WHERE id = ?", args: [id] });
   return c.json({ success: true });
 });
+router2.post("/bulk-delete", async (c) => {
+  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const { ids } = z2.object({ ids: z2.array(z2.string()).min(1) }).parse(await c.req.json());
+  const db = await getDb();
+  const statements = ids.map((id) => ({ sql: "DELETE FROM leads WHERE id = ?", args: [id] }));
+  await db.batch(statements, "write");
+  return c.json({ success: true, deleted: ids.length });
+});
 var leads_default = router2;
 
 // src/routes/messages.ts
 import { Hono as Hono3 } from "hono";
 import { z as z3 } from "zod";
 
-// src/lib/agentmail.ts
-var API_BASE = (process.env.AGENTMAIL_API_BASE ?? "https://api.agentmail.to/v0").replace(/\/+$/, "");
-function agentmailConfig() {
-  const apiKey = process.env.AGENTMAIL_API_KEY;
-  const inbox = process.env.AGENTMAIL_INBOX;
-  if (!apiKey || !inbox) {
-    throw new Error("AGENTMAIL_API_KEY and AGENTMAIL_INBOX must be set");
+// src/lib/mailer.ts
+import nodemailer from "nodemailer";
+import { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
+function mailerConfig() {
+  const user = process.env.GMAIL_USER;
+  const appPassword = process.env.GMAIL_APP_PASSWORD;
+  if (!user || !appPassword) {
+    throw new Error("GMAIL_USER and GMAIL_APP_PASSWORD must be set");
   }
-  return { apiKey, inbox };
+  return {
+    user,
+    appPassword,
+    imapHost: process.env.GMAIL_IMAP_HOST ?? "imap.gmail.com",
+    smtpHost: process.env.GMAIL_SMTP_HOST ?? "smtp.gmail.com"
+  };
 }
-async function agentmailFetch(path, init) {
-  const { apiKey } = agentmailConfig();
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      ...init?.headers ?? {}
-    }
-  });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(`AgentMail ${init?.method ?? "GET"} ${path} failed (${res.status}): ${detail.slice(0, 500)}`);
+var transporter;
+function getTransporter() {
+  if (!transporter) {
+    const { user, appPassword, smtpHost } = mailerConfig();
+    transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: 465,
+      secure: true,
+      auth: { user, pass: appPassword }
+    });
   }
-  return res.json();
+  return transporter;
 }
 async function sendMessage(args) {
-  const { inbox } = agentmailConfig();
-  return agentmailFetch(`/inboxes/${encodeURIComponent(inbox)}/messages/send`, {
-    method: "POST",
-    headers: { "Idempotency-Key": crypto.randomUUID() },
-    body: JSON.stringify({ to: args.to, subject: args.subject, text: args.text, ...args.html ? { html: args.html } : {} })
+  const { user } = mailerConfig();
+  const info = await getTransporter().sendMail({
+    from: user,
+    to: args.to,
+    subject: args.subject,
+    text: args.text,
+    ...args.html ? { html: args.html } : {}
   });
+  return { message_id: info.messageId ?? null, thread_id: null };
+}
+async function withImap(fn) {
+  const { user, appPassword, imapHost } = mailerConfig();
+  const client2 = new ImapFlow({
+    host: imapHost,
+    port: 993,
+    secure: true,
+    auth: { user, pass: appPassword },
+    logger: false
+  });
+  await client2.connect();
+  try {
+    return await fn(client2);
+  } finally {
+    await client2.logout().catch(() => client2.close());
+  }
 }
 async function listMessages(args = {}) {
-  const { inbox } = agentmailConfig();
-  return agentmailFetch(`/inboxes/${encodeURIComponent(inbox)}/messages?limit=${args.limit ?? 50}`);
+  const limit = args.limit ?? 50;
+  const messages = await withImap(async (client2) => {
+    const out = [];
+    for (const mailbox of ["INBOX", "[Gmail]/Sent Mail"]) {
+      let lock;
+      try {
+        lock = await client2.getMailboxLock(mailbox);
+      } catch {
+        continue;
+      }
+      try {
+        const box = client2.mailbox;
+        if (!box || typeof box === "boolean") continue;
+        const total = box.exists;
+        if (!total) continue;
+        const from = Math.max(1, total - limit + 1);
+        for await (const msg of client2.fetch(`${from}:${total}`, { envelope: true, source: true, uid: true })) {
+          if (!msg.source) continue;
+          const parsed = await simpleParser(msg.source);
+          out.push(toFetchedMessage(parsed, msg.uid, mailbox));
+        }
+      } finally {
+        lock.release();
+      }
+    }
+    out.sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? ""));
+    return out.slice(0, limit);
+  });
+  return { messages };
 }
 async function getMessage(messageId) {
-  const { inbox } = agentmailConfig();
-  return agentmailFetch(`/inboxes/${encodeURIComponent(inbox)}/messages/${encodeURIComponent(messageId)}`);
+  const [mailbox, uidStr] = messageId.split(":");
+  const uid = Number(uidStr);
+  return withImap(async (client2) => {
+    const lock = await client2.getMailboxLock(mailbox);
+    try {
+      for await (const msg of client2.fetch({ uid }, { source: true, uid: true }, { uid: true })) {
+        if (!msg.source) continue;
+        const parsed = await simpleParser(msg.source);
+        return toFetchedMessage(parsed, msg.uid, mailbox);
+      }
+      throw new Error(`Message ${messageId} not found`);
+    } finally {
+      lock.release();
+    }
+  });
+}
+function toFetchedMessage(parsed, uid, mailbox) {
+  const isSent = mailbox.toLowerCase().includes("sent");
+  return {
+    message_id: `${mailbox}:${uid}`,
+    thread_id: parsed.headers.get("thread-index") ?? null,
+    from: parsed.from?.text ?? null,
+    to: Array.isArray(parsed.to) ? parsed.to.map((t) => t.text).join(", ") : parsed.to?.text ?? null,
+    subject: parsed.subject ?? null,
+    text: parsed.text ?? null,
+    html: typeof parsed.html === "string" ? parsed.html : null,
+    extracted_text: parsed.text ?? null,
+    extracted_html: typeof parsed.html === "string" ? parsed.html : null,
+    timestamp: parsed.date ? parsed.date.toISOString() : null,
+    labels: isSent ? ["sent"] : []
+  };
 }
 
 // src/lib/events.ts
@@ -966,7 +1056,7 @@ router3.post("/emails/send", async (c) => {
   if (!lead?.email) return c.json({ error: "Lead has no email address \u2014 add one before sending" }, 400);
   try {
     const sent = await sendMessage({ to: lead.email, subject: row.subject, text: row.body });
-    const inbox = process.env.AGENTMAIL_INBOX ?? "";
+    const inbox = process.env.GMAIL_USER ?? "";
     const now = (/* @__PURE__ */ new Date()).toISOString();
     await db.execute({
       sql: "UPDATE email_messages SET status = 'sent', sent_at = ?, from_email = ?, to_email = ?, agentmail_message_id = ?, agentmail_thread_id = ? WHERE id = ?",
@@ -1266,19 +1356,22 @@ function gateway() {
   return createOpenAICompatible({ name: "ai-provider", apiKey, baseURL });
 }
 function leadsBlock(leads) {
-  return leads.map((l) => `- [${l.id.slice(0, 8)}] ${l.name} \xB7 ${l.company ?? ""} \xB7 ${l.city ?? ""} \xB7 status=${l.status} \xB7 score=${l.score}`).join("\n");
+  return leads.map((l) => `- [${l.id.slice(0, 8)}] ${l.name} \xB7 ${l.company ?? ""} \xB7 ${l.city ?? ""} \xB7 email=${l.email ?? "\u2014"} \xB7 phone=${l.phone ?? "\u2014"} \xB7 status=${l.status} \xB7 score=${l.score}`).join("\n");
 }
+var historySchema = z4.array(z4.object({ role: z4.enum(["user", "assistant"]), content: z4.string() }));
 router4.post("/chat", async (c) => {
   if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
-  const { question, leads } = z4.object({ question: z4.string(), leads: z4.array(z4.any()) }).parse(await c.req.json());
+  const { question, leads, history } = z4.object({ question: z4.string(), leads: z4.array(z4.any()), history: historySchema.optional() }).parse(await c.req.json());
   const ai = gateway();
   const { text } = await generateText({
     model: ai(MODEL),
-    system: "You are an assistant for a lead management CRM. Answer ONLY using the provided leads data. Be concise. Cite leads as [lead:FULL_ID]. Do not invent leads.",
-    prompt: `Leads (${leads.length}):
-${leadsBlock(leads)}
-
-User question: ${question}`
+    system: 'You are an assistant for a lead management CRM. Answer ONLY using the provided leads data. Be concise. Cite leads as [lead:FULL_ID]. Do not invent leads or their data, and never substitute a different lead when the one being discussed lacks a field \u2014 say that field is missing instead. The conversation may reference a lead named earlier in the thread \u2014 use that context to resolve follow-up questions (e.g. "his email" or "show me his number" refers to the lead just discussed, not a different one).',
+    messages: [
+      { role: "user", content: `Leads (${leads.length}):
+${leadsBlock(leads)}` },
+      ...history ?? [],
+      { role: "user", content: question }
+    ]
   });
   const ids = Array.from(text.matchAll(/\[lead:([a-z0-9-]{8,})\]/gi)).map((m) => m[1]);
   const cited = Array.from(new Set(ids)).map((short) => leads.find((l) => l.id.startsWith(short))?.id).filter(Boolean);
@@ -1574,7 +1667,7 @@ if (process.env.NODE_ENV !== "production") {
   console.log(`Backend running on http://localhost:${port}`);
   serve({ fetch: app.fetch, port });
 } else {
-  console.log("Leadflow backend in serverless mode \u2014 no listener started.");
+  console.log("GradLead AI backend in serverless mode \u2014 no listener started.");
 }
 
 // src/vercel.ts
