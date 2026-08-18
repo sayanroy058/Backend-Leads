@@ -21,7 +21,7 @@ function leadsBlock(leads: LeadCtx[]) {
     .join("\n");
 }
 
-type LeadCtx = { id: string; name: string; company: string | null; email: string | null; phone: string | null; city: string | null; status: string; score: number; value: number | null; source: string | null; notes: string | null };
+type LeadCtx = { id: string; name: string; company: string | null; email: string | null; phone: string | null; city: string | null; status: string; score: number };
 
 const historySchema = z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string() }));
 
