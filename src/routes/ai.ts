@@ -16,18 +16,29 @@ function gateway() {
 }
 
 function leadsBlock(leads: LeadCtx[]) {
-  return leads.map((l) => `- [${l.id.slice(0, 8)}] ${l.name} · ${l.company ?? ""} · ${l.city ?? ""} · status=${l.status} · score=${l.score}`).join("\n");
+  return leads
+    .map((l) => `- [${l.id.slice(0, 8)}] ${l.name} · ${l.company ?? ""} · ${l.city ?? ""} · email=${l.email ?? "—"} · phone=${l.phone ?? "—"} · status=${l.status} · score=${l.score}`)
+    .join("\n");
 }
 
-type LeadCtx = { id: string; name: string; company: string | null; email: string | null; city: string | null; status: string; score: number; value: number | null; source: string | null; notes: string | null };
+type LeadCtx = { id: string; name: string; company: string | null; email: string | null; phone: string | null; city: string | null; status: string; score: number; value: number | null; source: string | null; notes: string | null };
+
+const historySchema = z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string() }));
 
 router.post("/chat", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
-  const { question, leads } = z.object({ question: z.string(), leads: z.array(z.any()) }).parse(await c.req.json());
+  const { question, leads, history } = z
+    .object({ question: z.string(), leads: z.array(z.any()), history: historySchema.optional() })
+    .parse(await c.req.json());
   const ai = gateway();
   const { text } = await generateText({
-    model: ai(MODEL), system: "You are an assistant for a lead management CRM. Answer ONLY using the provided leads data. Be concise. Cite leads as [lead:FULL_ID]. Do not invent leads.",
-    prompt: `Leads (${leads.length}):\n${leadsBlock(leads as LeadCtx[])}\n\nUser question: ${question}`,
+    model: ai(MODEL),
+    system: "You are an assistant for a lead management CRM. Answer ONLY using the provided leads data. Be concise. Cite leads as [lead:FULL_ID]. Do not invent leads or their data, and never substitute a different lead when the one being discussed lacks a field — say that field is missing instead. The conversation may reference a lead named earlier in the thread — use that context to resolve follow-up questions (e.g. \"his email\" or \"show me his number\" refers to the lead just discussed, not a different one).",
+    messages: [
+      { role: "user", content: `Leads (${leads.length}):\n${leadsBlock(leads as LeadCtx[])}` },
+      ...(history ?? []),
+      { role: "user", content: question },
+    ],
   });
   const ids = Array.from(text.matchAll(/\[lead:([a-z0-9-]{8,})\]/gi)).map((m) => m[1]);
   const cited = Array.from(new Set(ids)).map((short) => (leads as LeadCtx[]).find((l) => l.id.startsWith(short))?.id).filter(Boolean) as string[];

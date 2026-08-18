@@ -167,4 +167,13 @@ router.delete("/:id", async (c) => {
   return c.json({ success: true });
 });
 
+router.post("/bulk-delete", async (c) => {
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const { ids } = z.object({ ids: z.array(z.string()).min(1) }).parse(await c.req.json());
+  const db = await getDb();
+  const statements: InStatement[] = ids.map((id) => ({ sql: "DELETE FROM leads WHERE id = ?", args: [id] }));
+  await db.batch(statements, "write"); // atomic bulk delete
+  return c.json({ success: true, deleted: ids.length });
+});
+
 export default router;
