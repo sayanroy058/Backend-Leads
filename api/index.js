@@ -684,19 +684,19 @@ async function insertEvent(db, e) {
 }
 
 // src/lib/whatsapp.ts
-var DEFAULT_GRAPH = "https://graph.facebook.com/v21.0";
+var DEFAULT_SESSION = "default";
 function env(name) {
   return (process.env[name] ?? "").trim();
 }
 function whatsappConfig() {
+  const apiKey = env("RELAYX_API_KEY");
   return {
-    enabled: Boolean(env("WHATSAPP_API_TOKEN") && env("WHATSAPP_PHONE_ID")),
-    base: (env("WHATSAPP_API_BASE") || DEFAULT_GRAPH).replace(/\/+$/, ""),
-    token: env("WHATSAPP_API_TOKEN"),
-    phoneId: env("WHATSAPP_PHONE_ID"),
-    fromNumber: env("WHATSAPP_FROM_NUMBER"),
-    verifyToken: env("WHATSAPP_WEBHOOK_VERIFY_TOKEN"),
-    webhookSecret: env("WHATSAPP_WEBHOOK_SECRET")
+    enabled: Boolean(apiKey),
+    base: (env("RELAYX_BASE_URL") || "").replace(/\/+$/, ""),
+    apiKey,
+    session: env("RELAYX_SESSION") || DEFAULT_SESSION,
+    fromNumber: env("RELAYX_FROM_NUMBER"),
+    webhookSecret: env("RELAYX_WEBHOOK_SECRET")
   };
 }
 function normalizePhone(raw) {
@@ -710,76 +710,154 @@ function phoneMatches(a, b) {
   if (len === 0) return false;
   return na.slice(-len) === nb.slice(-len);
 }
-function verifyHandshake(mode, token, challenge) {
+function authorizeWebhook(authHeader) {
   const cfg = whatsappConfig();
-  if (mode === "subscribe" && token && cfg.verifyToken && token === cfg.verifyToken && challenge) {
-    return { ok: true, challenge };
-  }
-  return { ok: false, challenge: null };
-}
-async function authorizeWebhook(headerValue) {
-  const cfg = whatsappConfig();
-  if (!cfg.webhookSecret) return true;
-  if (!headerValue) return false;
-  return headerValue === cfg.webhookSecret;
+  if (!cfg.webhookSecret) return { ok: true };
+  if (!authHeader) return { ok: false };
+  return { ok: authHeader === cfg.webhookSecret };
 }
 function normalizeInbound(body) {
   const out = [];
-  if (!body || typeof body !== "object") return out;
-  const messages = [];
-  const contacts = [];
-  if (Array.isArray(body?.entry)) {
-    for (const entry of body.entry) {
-      for (const change of entry?.changes ?? []) {
-        const value = change?.value;
-        if (Array.isArray(value?.messages)) messages.push(...value.messages);
-        if (Array.isArray(value?.contacts)) contacts.push(...value.contacts);
+  const b = body ?? {};
+  if (b.event === "message" && b.data) {
+    const m = fromWaWebJs(b.data);
+    if (m) out.push(m);
+    return out;
+  }
+  if (Array.isArray(b.messages)) {
+    for (const raw of b.messages) {
+      const m = fromWaWebJs(raw);
+      if (m) out.push(m);
+    }
+    if (out.length) return out;
+  }
+  if (b.object === "whatsapp_business_account") {
+    const entries = Array.isArray(b.entry) ? b.entry : [];
+    for (const entry of entries) {
+      const changes = entry?.changes;
+      if (!Array.isArray(changes)) continue;
+      for (const ch of changes) {
+        const msgs = ch?.value?.messages;
+        if (!Array.isArray(msgs)) continue;
+        for (const m of msgs) {
+          const n = fromMeta(m);
+          if (n) out.push(n);
+        }
       }
     }
-  } else if (Array.isArray(body?.messages)) {
-    messages.push(...body.messages);
-    if (Array.isArray(body?.contacts)) contacts.push(...body.contacts);
+    if (out.length) return out;
   }
-  const contactByWa = /* @__PURE__ */ new Map();
-  for (const c of contacts) {
-    if (c?.wa_id) contactByWa.set(String(c.wa_id), c?.profile?.name ?? null);
-  }
-  for (const m of messages) {
-    if (m?.type !== "text") continue;
-    const from = String(m.from ?? "").replace(/[^\d]/g, "");
-    const body2 = (m?.text?.body ?? "").toString();
-    if (!from || !body2) continue;
-    const tsNum = Number(m.timestamp);
+  if (typeof b.from === "string") {
     out.push({
-      from,
-      contactName: contactByWa.get(from) ?? null,
-      body: body2,
-      providerMessageId: String(m.id ?? `${from}-${m.timestamp}-${body2.slice(0, 16)}`),
-      timestamp: Number.isFinite(tsNum) ? new Date(tsNum * 1e3).toISOString() : (/* @__PURE__ */ new Date()).toISOString(),
-      messageType: "text"
+      from: b.from,
+      body: typeof b.body === "string" ? b.body : "",
+      contactName: typeof b.pushName === "string" ? b.pushName : typeof b.contactName === "string" ? b.contactName : null,
+      fromMe: Boolean(b.fromMe),
+      timestamp: typeof b.timestamp === "number" ? new Date(b.timestamp * 1e3).toISOString() : null,
+      providerMessageId: String(b.id ?? b.providerMessageId ?? `${b.from}-${Date.now()}`),
+      messageType: typeof b.messageType === "string" ? b.messageType : "text"
     });
+    return out;
   }
   return out;
 }
+function fromWaWebJs(m) {
+  const key = m?.key ?? m;
+  const remoteJid = typeof key?.remoteJid === "string" ? key.remoteJid : typeof key?.jid === "string" ? key.jid : void 0;
+  if (!remoteJid) return null;
+  const phone = remoteJid.split("@")[0]?.trim() ?? remoteJid;
+  const fromMe = Boolean(key?.fromMe);
+  const msg = m?.message ?? {};
+  let text = "";
+  const conv = msg.conversation;
+  if (typeof conv === "string") text = conv;
+  else {
+    const ext = msg.extendedTextMessage;
+    if (typeof ext?.text === "string") text = ext.text;
+    else {
+      const txt = msg.text;
+      if (typeof txt?.body === "string") text = txt.body;
+      else {
+        const img = msg.imageMessage;
+        if (typeof img?.caption === "string") text = `[image] ${img.caption}`;
+        else {
+          const vid = msg.videoMessage;
+          if (typeof vid?.caption === "string") text = `[video] ${vid.caption}`;
+          else if (msg.audioMessage && typeof msg.audioMessage === "object") text = "[audio]";
+          else if (msg.documentMessage && typeof msg.documentMessage === "object") text = "[document]";
+          else if (msg.stickerMessage && typeof msg.stickerMessage === "object") text = "[sticker]";
+          else if (msg.locationMessage && typeof msg.locationMessage === "object") text = "[location]";
+        }
+      }
+    }
+  }
+  const tsNum = typeof m?.messageTimestamp === "number" ? m.messageTimestamp : typeof m?.timestamp === "number" ? m.timestamp : NaN;
+  return {
+    from: phone,
+    body: text,
+    contactName: typeof m?.pushName === "string" ? m.pushName : null,
+    fromMe,
+    timestamp: Number.isFinite(tsNum) ? new Date(tsNum * 1e3).toISOString() : null,
+    providerMessageId: String(key?.id ?? m?.id ?? `${phone}-${Date.now()}`),
+    messageType: guessMessageType(msg)
+  };
+}
+function fromMeta(m) {
+  if (typeof m?.from !== "string") return null;
+  const tsNum = typeof m?.timestamp === "number" ? m.timestamp : NaN;
+  let text = "";
+  const txt2 = m.text;
+  if (typeof txt2?.body === "string") text = txt2.body;
+  else if (m?.type === "image") text = "[image]";
+  else if (m?.type === "audio") text = "[audio]";
+  else if (m?.type === "document") text = "[document]";
+  else if (m?.type === "sticker") text = "[sticker]";
+  else if (m?.type === "location") text = "[location]";
+  else if (m?.type === "contacts") text = "[contact]";
+  else text = "";
+  return {
+    from: m.from,
+    body: text,
+    contactName: typeof m?.pushName === "string" ? m.pushName : null,
+    fromMe: false,
+    timestamp: Number.isFinite(tsNum) ? new Date(tsNum * 1e3).toISOString() : null,
+    providerMessageId: String(m?.id ?? `${m.from}-${Date.now()}`),
+    messageType: typeof m?.type === "string" ? m.type : "text"
+  };
+}
+function guessMessageType(msg) {
+  if (msg.conversation) return "text";
+  const ext = msg.extendedTextMessage;
+  if (typeof ext?.text === "string") return "text";
+  const txt = msg.text;
+  if (typeof txt?.body === "string") return "text";
+  if (msg.imageMessage) return "image";
+  if (msg.videoMessage) return "video";
+  if (msg.audioMessage) return "audio";
+  if (msg.documentMessage) return "document";
+  if (msg.stickerMessage) return "sticker";
+  if (msg.locationMessage) return "location";
+  if (msg.contactMessage) return "contact";
+  return "text";
+}
 async function sendText(to, text) {
   const cfg = whatsappConfig();
-  if (!cfg.enabled) return { ok: false, providerMessageId: null, error: "WhatsApp provider is not configured (WHATSAPP_API_TOKEN / WHATSAPP_PHONE_ID)" };
-  if (!cfg.phoneId) return { ok: false, providerMessageId: null, error: "WHATSAPP_PHONE_ID is not set" };
-  const url = `${cfg.base}/${encodeURIComponent(cfg.phoneId)}/messages`;
+  if (!cfg.enabled) return { ok: false, providerMessageId: null, error: "WhatsApp provider is not configured (RELAYX_API_KEY)" };
+  if (!cfg.base) return { ok: false, providerMessageId: null, error: "RELAYX_BASE_URL is not set" };
+  const chatId = `${normalizePhone(to)}@c.us`;
+  const url = `${cfg.base}/api/sendText`;
   let res;
   try {
     res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${cfg.token}`
+        "X-Api-Key": cfg.apiKey
       },
       body: JSON.stringify({
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: normalizePhone(to),
-        type: "text",
-        text: { body: text }
+        session: cfg.session,
+        chatId,
+        text
       })
     });
   } catch (e) {
@@ -790,14 +868,15 @@ async function sendText(to, text) {
     return { ok: false, providerMessageId: null, error: `WhatsApp send failed (${res.status}): ${detail.slice(0, 500)}` };
   }
   const json = await res.json().catch(() => ({}));
-  return { ok: true, providerMessageId: json?.messages?.[0]?.id ?? null };
+  const providerMessageId = json?.message?.id ?? json?.messages?.[0]?.id ?? json?.id ?? null;
+  return { ok: true, providerMessageId };
 }
 function workingHoursConfig() {
   return {
-    start: env("WHATSAPP_WORKING_HOURS_START") || "09:00",
+    start: env("RELAYX_WORKING_HOURS_START") || "09:00",
     // 24h "HH:MM"
-    end: env("WHATSAPP_WORKING_HOURS_END") || "18:00",
-    tz: env("WHATSAPP_WORKING_TZ") || "America/New_York"
+    end: env("RELAYX_WORKING_HOURS_END") || "18:00",
+    tz: env("RELAYX_WORKING_TZ") || "America/New_York"
   };
 }
 function isWithinWorkingHours(date) {
@@ -1065,7 +1144,13 @@ router3.post("/whatsapps/send", async (c) => {
   if (!body) return c.json({ error: "Nothing to send \u2014 message body is empty" }, 400);
   const lead = (await db.execute({ sql: "SELECT phone FROM leads WHERE id = ?", args: [leadId] })).rows[0];
   if (!lead?.phone) return c.json({ error: "Lead has no phone number \u2014 add one before sending" }, 400);
-  const send = await sendText(lead.phone, body);
+  let send;
+  try {
+    send = await sendText(lead.phone, body);
+  } catch (e) {
+    console.error("SEND TEXT THREW:", e);
+    send = { ok: false, providerMessageId: null, error: e.message };
+  }
   if (!send.ok) return c.json({ error: send.error ?? "WhatsApp send failed" }, 502);
   const now = (/* @__PURE__ */ new Date()).toISOString();
   await db.execute({
@@ -1347,23 +1432,12 @@ var conversations_default = router5;
 import { Hono as Hono6 } from "hono";
 var ACK_DEBOUNCE_MS = 5 * 60 * 1e3;
 var router6 = new Hono6();
-router6.get("/", (c) => {
-  const mode = c.req.query("hub.mode");
-  const token = c.req.query("hub.verify_token");
-  const challenge = c.req.query("hub.challenge");
-  const { ok, challenge: ch } = verifyHandshake(mode, token, challenge);
-  if (!ok) return c.text("Verification failed", 403);
-  return c.text(ch ?? "");
-});
+router6.get("/", (c) => c.text("ok"));
 router6.post("/", async (c) => {
-  const authHeader = c.req.header("x-webhook-secret") ?? c.req.header("x-hub-signature-256");
-  if (!await authorizeWebhook(authHeader)) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
+  const authHeader = c.req.header("x-webhook-secret") ?? c.req.header("x-api-key");
+  const { ok } = authorizeWebhook(authHeader);
+  if (!ok) return c.json({ error: "Unauthorized" }, 401);
   const body = await c.req.json().catch(() => ({}));
-  if (body?.object === "whatsapp_business_account") {
-    return c.json({ status: "ok" });
-  }
   const inbound = normalizeInbound(body);
   if (!inbound.length) return c.json({ status: "ok", received: 0 });
   const db = await getDb();
@@ -1402,7 +1476,7 @@ router6.post("/", async (c) => {
       summary: msg.body.slice(0, 120),
       content: msg.body,
       source_ref: msg.providerMessageId,
-      metadata: { from: msg.from, to: cfg.fromNumber || null, message_type: msg.messageType },
+      metadata: { from: msg.from, to: cfg.fromNumber || null, message_type: msg.messageType, fromMe: msg.fromMe },
       created_at: now
     });
     let acknowledged = false;

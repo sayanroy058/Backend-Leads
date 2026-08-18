@@ -1,37 +1,37 @@
 // Phase 2 — WhatsApp provider bridge.
 //
-// This module talks to the WhatsApp business messaging API. It is built against
-// the standard **Meta WhatsApp Cloud API** contract (https://developers.facebook.com/docs/whatsapp/cloud-api),
-// which is also the shape exposed by provider bridges such as RelayX
-// (https://whatssapi.vercel.app) — a thin wrapper around the same webhook +
-// /{phone-id}/messages endpoints.
+// This module talks to WhatsApp via the **RelayX** HTTP API contract
+// (https://whatssapi.vercel.app/api-docs). RelayX exposes a simple REST
+// surface (POST /api/sendText, PUT /api/sessions/{name}, etc.) authenticated
+// by a single X-Api-Key header, and delivers inbound messages to our
+// webhook route in a WhatsApp-Web-JS-style payload (remoteJid, fromMe,
+// message.conversation, messageTimestamp, pushName).
 //
-// Everything provider-specific is configurable through env vars so the same
-// code can point at Meta directly or at any bridge that accepts Meta-shaped
-// webhooks and a Bearer token on the send endpoint:
-//   - WHATSAPP_API_BASE      base URL for the send endpoint (defaults to Meta Graph v21.0)
-//   - WHATSAPP_API_TOKEN     Bearer token (a Meta system-user token, or the bridge's key)
-//   - WHATSAPP_PHONE_ID      the phone-number-id that identifies the sending number
-//   - WHATSAPP_FROM_NUMBER   the sending WhatsApp number (E.164, e.g. "15551234567")
-//   - WHATSAPP_WEBHOOK_VERIFY_TOKEN  token used for the GET webhook handshake (hub.verify_token)
-//   - WHATSAPP_WEBHOOK_SECRET        optional secret matched against x-webhook-secret / X-Hub-Signature
-//   - WHATSAPP_WORKING_*     working-hours window used to decide auto-acknowledgements
+// Env vars (all OPTIONAL — features stay inert until set):
+//   RELAYX_API_KEY        the bridge API key (sent as X-Api-Key)
+//   RELAYX_BASE_URL       base URL of the RelayX instance
+//                          (e.g. https://whatssapi.vercel.app or http://localhost:3000)
+//   RELAYX_SESSION        session name on the bridge (default: "default")
+//   RELAYX_FROM_NUMBER    our sending number in E.164 (e.g. "15551234567")
+//   RELAYX_WEBHOOK_SECRET optional shared secret matched on inbound POSTs
+//                          (checked against x-api-key header or x-webhook-secret header)
+//   RELAYX_WORKING_*      working-hours window for off-hours auto-acks
 
-const DEFAULT_GRAPH = "https://graph.facebook.com/v21.0";
+const DEFAULT_SESSION = "default";
 
 function env(name: string): string {
   return (process.env[name] ?? "").trim();
 }
 
 export function whatsappConfig() {
+  const apiKey = env("RELAYX_API_KEY");
   return {
-    enabled: Boolean(env("WHATSAPP_API_TOKEN") && env("WHATSAPP_PHONE_ID")),
-    base: (env("WHATSAPP_API_BASE") || DEFAULT_GRAPH).replace(/\/+$/, ""),
-    token: env("WHATSAPP_API_TOKEN"),
-    phoneId: env("WHATSAPP_PHONE_ID"),
-    fromNumber: env("WHATSAPP_FROM_NUMBER"),
-    verifyToken: env("WHATSAPP_WEBHOOK_VERIFY_TOKEN"),
-    webhookSecret: env("WHATSAPP_WEBHOOK_SECRET"),
+    enabled: Boolean(apiKey),
+    base: (env("RELAYX_BASE_URL") || "").replace(/\/+$/, ""),
+    apiKey,
+    session: env("RELAYX_SESSION") || DEFAULT_SESSION,
+    fromNumber: env("RELAYX_FROM_NUMBER"),
+    webhookSecret: env("RELAYX_WEBHOOK_SECRET"),
   };
 }
 
@@ -60,107 +60,196 @@ export function phoneMatches(a: string | null | undefined, b: string | null | un
 }
 
 // ---------------------------------------------------------------------------
-// Webhook handshake & authorization
+// Webhook authorization + inbound normalization (RelayX / WhatsApp-Web-JS)
 // ---------------------------------------------------------------------------
 
-export interface HandshakeResult {
+export interface AuthResult {
   ok: boolean;
-  challenge: string | null;
-}
-
-/** Validate `hub.*` query params from a Meta GET verification request. */
-export function verifyHandshake(
-  mode: string | null | undefined,
-  token: string | null | undefined,
-  challenge: string | null | undefined
-): HandshakeResult {
-  const cfg = whatsappConfig();
-  if (mode === "subscribe" && token && cfg.verifyToken && token === cfg.verifyToken && challenge) {
-    return { ok: true, challenge };
-  }
-  return { ok: false, challenge: null };
 }
 
 /**
- * Authorize an inbound POST. Honors an explicit `x-webhook-secret` /
- * `X-Hub-Signature-256` header set by the provider, or falls back to a
- * configured shared secret when the bridge can't sign. If no secret is
- * configured the webhook is trusted as-is.
+ * Accept inbound webhook POSTs when:
+ *  - RELAYX_WEBHOOK_SECRET is NOT set  → allow all (no auth; useful with IP allow-list)
+ *  - RELAYX_WEBHOOK_SECRET IS set      → require x-api-key or x-webhook-secret header to match
  */
-export async function authorizeWebhook(headerValue: string | null | undefined): Promise<boolean> {
+export function authorizeWebhook(authHeader: string | null | undefined): AuthResult {
   const cfg = whatsappConfig();
-  if (!cfg.webhookSecret) return true;
-  if (!headerValue) return false;
-  return headerValue === cfg.webhookSecret;
+  if (!cfg.webhookSecret) return { ok: true };
+  if (!authHeader) return { ok: false };
+  return { ok: authHeader === cfg.webhookSecret };
 }
 
-// ---------------------------------------------------------------------------
-// Inbound payload normalization
-// ---------------------------------------------------------------------------
-
-export interface InboundWhatsApp {
-  from: string; // wa_id (E.164 digits)
-  contactName: string | null;
+export interface NormalizedMessage {
+  from: string;
   body: string;
+  contactName: string | null;
+  fromMe: boolean;
+  timestamp: string | null;
   providerMessageId: string;
-  timestamp: string; // ISO 8601
   messageType: string;
 }
 
 /**
- * Normalize a provider webhook body into a flat list of inbound text messages.
- * Handles the canonical Meta Cloud API shape:
- *   { object, entry: [{ changes: [{ value: { contacts, messages: [...] } }] }] }
- * and, defensively, a plain `{ messages: [...] }` array for flexible bridges.
+ * Parse inbound webhook payload into normalized messages.
+ *
+ * Accepted shapes (in priority order):
+ *
+ *  1) Wrapped event:
+ *     { event: "message", data: { key: { remoteJid, fromMe, id }, message: {...}, messageTimestamp, pushName } }
+ *
+ *  2) Raw WA-WEB-JS object:
+ *     { messages: [ { key: { remoteJid, fromMe, id }, message: {...}, messageTimestamp, pushName } ] }
+ *
+ *  3) Meta-style (still handled for safety):
+ *     { object: "whatsapp_business_account", entry: [ { changes: [ { value: { messages: [ { from, id, timestamp, type, text: { body } } ] } } ] } ] }
+ *
+ *  4) Flat:
+ *     { from, body, fromMe, timestamp, id }
  */
-export function normalizeInbound(body: any): InboundWhatsApp[] {
-  const out: InboundWhatsApp[] = [];
-  if (!body || typeof body !== "object") return out;
+export function normalizeInbound(body: unknown): NormalizedMessage[] {
+  const out: NormalizedMessage[] = [];
+  const b = (body as Record<string, unknown>) ?? {};
 
-  const messages: any[] = [];
-  const contacts: any[] = [];
+  // --- 1) Wrapped event { event, data } --------------------------------------
+  if ((b.event as string) === "message" && b.data) {
+    const m = fromWaWebJs(b.data as Record<string, unknown>);
+    if (m) out.push(m);
+    return out;
+  }
 
-  if (Array.isArray(body?.entry)) {
-    for (const entry of body.entry) {
-      for (const change of entry?.changes ?? []) {
-        const value = change?.value;
-        if (Array.isArray(value?.messages)) messages.push(...value.messages);
-        if (Array.isArray(value?.contacts)) contacts.push(...value.contacts);
+  // --- 2) Raw WA-WEB-JS array { messages: [...] } ---------------------------
+  if (Array.isArray(b.messages)) {
+    for (const raw of b.messages) {
+      const m = fromWaWebJs(raw as Record<string, unknown>);
+      if (m) out.push(m);
+    }
+    if (out.length) return out;
+  }
+
+  // --- 3) Meta-style { object, entry } ---------------------------------------
+  if ((b.object as string) === "whatsapp_business_account") {
+    const entries = Array.isArray(b.entry) ? b.entry : [];
+    for (const entry of entries) {
+      const changes = (entry as Record<string, unknown>)?.changes;
+      if (!Array.isArray(changes)) continue;
+      for (const ch of changes) {
+        const msgs = ((ch as Record<string, unknown>)?.value as Record<string, unknown>)?.messages;
+        if (!Array.isArray(msgs)) continue;
+        for (const m of msgs) {
+          const n = fromMeta(m as Record<string, unknown>);
+          if (n) out.push(n);
+        }
       }
     }
-  } else if (Array.isArray(body?.messages)) {
-    messages.push(...body.messages);
-    if (Array.isArray(body?.contacts)) contacts.push(...body.contacts);
+    if (out.length) return out;
   }
 
-  const contactByWa = new Map<string, string | null>();
-  for (const c of contacts) {
-    if (c?.wa_id) contactByWa.set(String(c.wa_id), c?.profile?.name ?? null);
-  }
-
-  for (const m of messages) {
-    if (m?.type !== "text") continue; // images/audio/etc. are out of scope for now
-    const from = String(m.from ?? "").replace(/[^\d]/g, "");
-    const body = (m?.text?.body ?? "").toString();
-    if (!from || !body) continue;
-    const tsNum = Number(m.timestamp);
+  // --- 4) Flat { from, body, ... } ------------------------------------------
+  if (typeof b.from === "string") {
     out.push({
-      from,
-      contactName: contactByWa.get(from) ?? null,
-      body,
-      providerMessageId: String(m.id ?? `${from}-${m.timestamp}-${body.slice(0, 16)}`),
-      timestamp: Number.isFinite(tsNum) ? new Date(tsNum * 1000).toISOString() : new Date().toISOString(),
-      messageType: "text",
+      from: b.from,
+      body: typeof b.body === "string" ? b.body : "",
+      contactName: typeof b.pushName === "string" ? b.pushName : typeof b.contactName === "string" ? b.contactName : null,
+      fromMe: Boolean((b as Record<string, unknown>).fromMe),
+      timestamp: typeof (b as Record<string, unknown>).timestamp === "number" ? new Date(((b as Record<string, unknown>).timestamp as number) * 1000).toISOString() : null,
+      providerMessageId: String((b as Record<string, unknown>).id ?? (b as Record<string, unknown>).providerMessageId ?? `${b.from}-${Date.now()}`),
+      messageType: typeof (b as Record<string, unknown>).messageType === "string" ? ((b as Record<string, unknown>).messageType as string) : "text",
     });
+    return out;
   }
 
   return out;
 }
 
+function fromWaWebJs(m: Record<string, unknown>): NormalizedMessage | null {
+  const key = (m?.key as Record<string, unknown>) ?? m;
+  const remoteJid: string | undefined = typeof key?.remoteJid === "string" ? (key.remoteJid as string) : typeof key?.jid === "string" ? (key.jid as string) : undefined;
+  if (!remoteJid) return null;
 
+  const phone = remoteJid.split("@")[0]?.trim() ?? remoteJid;
+  const fromMe = Boolean(key?.fromMe);
+  const msg = (m?.message as Record<string, unknown>) ?? {};
+
+  let text = "";
+  const conv = msg.conversation;
+  if (typeof conv === "string") text = conv as string;
+  else {
+    const ext = msg.extendedTextMessage as Record<string, unknown> | undefined;
+    if (typeof ext?.text === "string") text = ext.text as string;
+    else {
+      const txt = msg.text as Record<string, unknown> | undefined;
+      if (typeof txt?.body === "string") text = txt.body as string;
+      else {
+        const img = msg.imageMessage as Record<string, unknown> | undefined;
+        if (typeof img?.caption === "string") text = `[image] ${img.caption as string}`;
+        else {
+          const vid = msg.videoMessage as Record<string, unknown> | undefined;
+          if (typeof vid?.caption === "string") text = `[video] ${vid.caption as string}`;
+          else if (msg.audioMessage && typeof msg.audioMessage === "object") text = "[audio]";
+          else if (msg.documentMessage && typeof msg.documentMessage === "object") text = "[document]";
+          else if (msg.stickerMessage && typeof msg.stickerMessage === "object") text = "[sticker]";
+          else if (msg.locationMessage && typeof msg.locationMessage === "object") text = "[location]";
+        }
+      }
+    }
+  }
+
+  const tsNum = typeof m?.messageTimestamp === "number" ? (m.messageTimestamp as number) : typeof m?.timestamp === "number" ? (m.timestamp as number) : NaN;
+
+  return {
+    from: phone,
+    body: text,
+    contactName: typeof m?.pushName === "string" ? (m.pushName as string) : null,
+    fromMe,
+    timestamp: Number.isFinite(tsNum) ? new Date(tsNum * 1000).toISOString() : null,
+    providerMessageId: String(key?.id ?? m?.id ?? `${phone}-${Date.now()}`),
+    messageType: guessMessageType(msg),
+  };
+}
+
+function fromMeta(m: Record<string, unknown>): NormalizedMessage | null {
+  if (typeof m?.from !== "string") return null;
+  const tsNum = typeof m?.timestamp === "number" ? (m.timestamp as number) : NaN;
+  let text = "";
+  const txt2 = m.text as Record<string, unknown> | undefined;
+  if (typeof txt2?.body === "string") text = txt2.body as string;
+  else if ((m?.type as string) === "image") text = "[image]";
+  else if ((m?.type as string) === "audio") text = "[audio]";
+  else if ((m?.type as string) === "document") text = "[document]";
+  else if ((m?.type as string) === "sticker") text = "[sticker]";
+  else if ((m?.type as string) === "location") text = "[location]";
+  else if ((m?.type as string) === "contacts") text = "[contact]";
+  else text = "";
+
+  return {
+    from: m.from as string,
+    body: text,
+    contactName: typeof m?.pushName === "string" ? (m.pushName as string) : null,
+    fromMe: false,
+    timestamp: Number.isFinite(tsNum) ? new Date(tsNum * 1000).toISOString() : null,
+    providerMessageId: String(m?.id ?? `${m.from}-${Date.now()}`),
+    messageType: typeof m?.type === "string" ? (m.type as string) : "text",
+  };
+}
+
+function guessMessageType(msg: Record<string, unknown>): string {
+  if (msg.conversation) return "text";
+  const ext = msg.extendedTextMessage as Record<string, unknown> | undefined;
+  if (typeof ext?.text === "string") return "text";
+  const txt = msg.text as Record<string, unknown> | undefined;
+  if (typeof txt?.body === "string") return "text";
+  if (msg.imageMessage) return "image";
+  if (msg.videoMessage) return "video";
+  if (msg.audioMessage) return "audio";
+  if (msg.documentMessage) return "document";
+  if (msg.stickerMessage) return "sticker";
+  if (msg.locationMessage) return "location";
+  if (msg.contactMessage) return "contact";
+  return "text";
+}
 
 // ---------------------------------------------------------------------------
-// Outbound send
+// Outbound send (RelayX)
 // ---------------------------------------------------------------------------
 
 export interface SendResult {
@@ -170,29 +259,32 @@ export interface SendResult {
 }
 
 /**
- * Send a text message to `to` (E.164) via the provider, using the Meta Cloud
- * API send contract:  POST {base}/{phone_id}/messages  with a Bearer token.
+ * Send a text message to `to` (E.164) via RelayX.
+ * Contract: POST {base}/api/sendText with X-Api-Key header and body
+ * { session, chatId, text }.
+ * chatId format: {phone}@c.us (country code without +).
  */
 export async function sendText(to: string, text: string): Promise<SendResult> {
   const cfg = whatsappConfig();
-  if (!cfg.enabled) return { ok: false, providerMessageId: null, error: "WhatsApp provider is not configured (WHATSAPP_API_TOKEN / WHATSAPP_PHONE_ID)" };
-  if (!cfg.phoneId) return { ok: false, providerMessageId: null, error: "WHATSAPP_PHONE_ID is not set" };
+  if (!cfg.enabled) return { ok: false, providerMessageId: null, error: "WhatsApp provider is not configured (RELAYX_API_KEY)" };
+  if (!cfg.base) return { ok: false, providerMessageId: null, error: "RELAYX_BASE_URL is not set" };
 
-  const url = `${cfg.base}/${encodeURIComponent(cfg.phoneId)}/messages`;
+  // RelayX expects chatId in WhatsApp-Web-JS format: phone@c.us
+  const chatId = `${normalizePhone(to)}@c.us`;
+  const url = `${cfg.base}/api/sendText`;
+
   let res: Response;
   try {
     res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${cfg.token}`,
+        "X-Api-Key": cfg.apiKey,
       },
       body: JSON.stringify({
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: normalizePhone(to),
-        type: "text",
-        text: { body: text },
+        session: cfg.session,
+        chatId,
+        text,
       }),
     });
   } catch (e) {
@@ -205,7 +297,14 @@ export async function sendText(to: string, text: string): Promise<SendResult> {
   }
 
   const json = (await res.json().catch(() => ({}))) as any;
-  return { ok: true, providerMessageId: json?.messages?.[0]?.id ?? null };
+  // RelayX may return { success: true } or { message: { id: "..." } } — handle both.
+  const providerMessageId =
+    (json?.message?.id as string | undefined) ??
+    (json?.messages?.[0]?.id as string | undefined) ??
+    (json?.id as string | undefined) ??
+    null;
+
+  return { ok: true, providerMessageId };
 }
 
 // ---------------------------------------------------------------------------
@@ -214,9 +313,9 @@ export async function sendText(to: string, text: string): Promise<SendResult> {
 
 export function workingHoursConfig() {
   return {
-    start: env("WHATSAPP_WORKING_HOURS_START") || "09:00", // 24h "HH:MM"
-    end: env("WHATSAPP_WORKING_HOURS_END") || "18:00",
-    tz: env("WHATSAPP_WORKING_TZ") || "America/New_York",
+    start: env("RELAYX_WORKING_HOURS_START") || "09:00", // 24h "HH:MM"
+    end: env("RELAYX_WORKING_HOURS_END") || "18:00",
+    tz: env("RELAYX_WORKING_TZ") || "America/New_York",
   };
 }
 

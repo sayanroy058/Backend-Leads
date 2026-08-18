@@ -3,7 +3,6 @@ import type { Client } from "@libsql/client";
 import { getDb } from "../db";
 import { insertEvent } from "../lib/events";
 import {
-  verifyHandshake,
   authorizeWebhook,
   normalizeInbound,
   phoneMatches,
@@ -14,11 +13,11 @@ import {
   whatsappConfig,
 } from "../lib/whatsapp";
 
-// Phase 2 — WhatsApp inbound webhook.
+// Phase 2 — WhatsApp inbound webhook (RelayX / generic bridge).
 //
-// This route is PUBLIC (no auth): it is the URL you register with Meta /
-// RelayX as the WhatsApp webhook. GET performs the Meta Cloud API handshake;
-// POST receives inbound messages and routes them into the same Event /
+// This route is PUBLIC (no auth): it is the URL you register with RelayX
+// as the WhatsApp webhook. GET is a noop (no Meta-style handshake); POST
+// receives inbound messages and routes them into the same Event /
 // Conversation model as every other channel, matching contacts by phone number
 // so a lead who calls and later WhatsApps is ONE contact, ONE thread.
 //
@@ -28,30 +27,17 @@ const ACK_DEBOUNCE_MS = 5 * 60 * 1000; // only auto-ack once per ~5 min per numb
 
 const router = new Hono();
 
-// ---- Meta / bridge handshake (GET) ----
-router.get("/", (c) => {
-  const mode = c.req.query("hub.mode");
-  const token = c.req.query("hub.verify_token");
-  const challenge = c.req.query("hub.challenge");
-  const { ok, challenge: ch } = verifyHandshake(mode, token, challenge);
-  if (!ok) return c.text("Verification failed", 403);
-  return c.text(ch ?? "");
-});
+// GET is a simple health endpoint — RelayX does not require a handshake.
+router.get("/", (c) => c.text("ok"));
 
 // ---- Inbound messages (POST) ----
 router.post("/", async (c) => {
-  // Authorize via webhook header or, when the bridge can't sign, a shared secret.
-  const authHeader = c.req.header("x-webhook-secret") ?? c.req.header("x-hub-signature-256");
-  if (!(await authorizeWebhook(authHeader))) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
+  // Authorize via shared-secret header if configured.
+  const authHeader = c.req.header("x-webhook-secret") ?? c.req.header("x-api-key");
+  const { ok } = authorizeWebhook(authHeader);
+  if (!ok) return c.json({ error: "Unauthorized" }, 401);
 
   const body = await c.req.json().catch(() => ({}));
-  if (body?.object === "whatsapp_business_account") {
-    // Meta sends a status-check payload for the business-account object.
-    return c.json({ status: "ok" });
-  }
-
   const inbound = normalizeInbound(body);
   if (!inbound.length) return c.json({ status: "ok", received: 0 });
 
@@ -101,7 +87,7 @@ router.post("/", async (c) => {
       summary: msg.body.slice(0, 120),
       content: msg.body,
       source_ref: msg.providerMessageId,
-      metadata: { from: msg.from, to: cfg.fromNumber || null, message_type: msg.messageType },
+      metadata: { from: msg.from, to: cfg.fromNumber || null, message_type: msg.messageType, fromMe: msg.fromMe },
       created_at: now,
     });
 

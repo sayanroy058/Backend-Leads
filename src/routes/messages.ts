@@ -277,7 +277,13 @@ router.post("/whatsapps/send", async (c) => {
   const lead = (await db.execute({ sql: "SELECT phone FROM leads WHERE id = ?", args: [leadId] })).rows[0] as unknown as { phone: string | null } | undefined;
   if (!lead?.phone) return c.json({ error: "Lead has no phone number — add one before sending" }, 400);
 
-  const send = await sendText(lead.phone, body);
+  let send: { ok: boolean; providerMessageId: string | null; error?: string };
+  try {
+    send = await sendText(lead.phone, body);
+  } catch (e) {
+    console.error("SEND TEXT THREW:", e);
+    send = { ok: false, providerMessageId: null, error: (e as Error).message };
+  }
   if (!send.ok) return c.json({ error: send.error ?? "WhatsApp send failed" }, 502);
 
   const now = new Date().toISOString();
