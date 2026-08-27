@@ -6,9 +6,33 @@ import { authenticate } from "../middleware/auth";
 import { sendMessage, listMessages, getMessage } from "../lib/mailer";
 import { insertEvent } from "../lib/events";
 import { computeLeadScore } from "./leads";
-import { sendText, whatsappConfig } from "../lib/whatsapp";
+import { sendText, sendMedia, whatsappConfig } from "../lib/whatsapp";
 
 const router = new Hono();
+
+// File attachments: { filename, contentType, data } where data is base64.
+// Kept small (2 MB / file, 6 files) to stay inside serverless body limits.
+const attachmentSchema = z
+  .array(
+    z.object({
+      filename: z.string().min(1).max(255),
+      contentType: z.string().max(120),
+      data: z.string().min(1),
+    })
+  )
+  .max(6)
+  .optional();
+
+/** Parse the stored JSON attachments column into an array (safe on bad data). */
+function parseAttachments(raw: string | null | undefined): { filename: string; contentType: string; data: string }[] {
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
 
 // ---- Chat ----
 router.get("/chat", async (c) => {
@@ -37,14 +61,31 @@ router.get("/emails", async (c) => {
 
 router.post("/emails", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
-  const data = z.array(z.object({ lead_id: z.string(), subject: z.string(), body: z.string(), tone: z.string().optional(), goal: z.string().optional(), status: z.string().optional() })).parse(await c.req.json());
+  const data = z
+    .array(
+      z.object({
+        lead_id: z.string(),
+        subject: z.string(),
+        body: z.string(),
+        tone: z.string().optional(),
+        goal: z.string().optional(),
+        status: z.string().optional(),
+        attachments: attachmentSchema,
+      })
+    )
+    .parse(await c.req.json());
   const db = await getDb();
-  const statements: InStatement[] = data.map((r) => ({
-    sql: "INSERT INTO email_messages (id, lead_id, subject, body, tone, goal, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    args: [crypto.randomUUID(), r.lead_id, r.subject, r.body, r.tone ?? null, r.goal ?? null, r.status ?? "draft"],
-  }));
+  const items: { id: string; lead_id: string }[] = [];
+  const statements: InStatement[] = data.map((r) => {
+    const id = crypto.randomUUID();
+    items.push({ id, lead_id: r.lead_id });
+    return {
+      sql: "INSERT INTO email_messages (id, lead_id, subject, body, tone, goal, status, attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      args: [id, r.lead_id, r.subject, r.body, r.tone ?? null, r.goal ?? null, r.status ?? "draft", r.attachments && r.attachments.length ? JSON.stringify(r.attachments) : null],
+    };
+  });
   if (statements.length) await db.batch(statements, "write"); // atomic insert
-  return c.json({ success: true });
+  return c.json({ success: true, items });
 });
 
 router.post("/emails/status", async (c) => {
@@ -66,7 +107,7 @@ router.post("/emails/send", async (c) => {
   const { id } = z.object({ id: z.string() }).parse(await c.req.json());
   const db = await getDb();
   const row = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0] as unknown as
-    | { lead_id: string | null; subject: string; body: string }
+    | { lead_id: string | null; subject: string; body: string; attachments: string | null }
     | undefined;
   if (!row) return c.json({ error: "Email not found" }, 404);
   if (!row.lead_id) return c.json({ error: "Email is not linked to a lead" }, 400);
@@ -74,8 +115,15 @@ router.post("/emails/send", async (c) => {
     | { email: string | null }
     | undefined;
   if (!lead?.email) return c.json({ error: "Lead has no email address — add one before sending" }, 400);
+  // Attachments stored on the row: JSON [{ filename, contentType, data(base64) }]
+  // -> nodemailer attachment buffers.
+  const attachments = parseAttachments(row.attachments).map((a) => ({
+    filename: a.filename,
+    contentType: a.contentType,
+    content: Buffer.from(a.data, "base64"),
+  }));
   try {
-    const sent = await sendMessage({ to: lead.email, subject: row.subject, text: row.body });
+    const sent = await sendMessage({ to: lead.email, subject: row.subject, text: row.body, attachments });
     const inbox = process.env.GMAIL_USER ?? "";
     const now = new Date().toISOString();
     await db.execute({
@@ -207,18 +255,22 @@ router.get("/whatsapps", async (c) => {
 
 router.post("/whatsapps", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
-  const data = z.array(z.object({ lead_id: z.string(), body: z.string(), status: z.string().optional() })).parse(await c.req.json());
+  const data = z
+    .array(z.object({ lead_id: z.string(), body: z.string(), status: z.string().optional(), attachments: attachmentSchema }))
+    .parse(await c.req.json());
   const db = await getDb();
   const now = new Date().toISOString();
+  const items: { id: string; lead_id: string }[] = [];
   const statements: InStatement[] = data.flatMap((r) => {
     const id = crypto.randomUUID();
+    items.push({ id, lead_id: r.lead_id });
     return [
-      { sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status) VALUES (?, ?, ?, ?)", args: [id, r.lead_id, r.body, r.status ?? "draft"] },
+      { sql: "INSERT INTO whatsapp_messages (id, lead_id, body, status, attachments) VALUES (?, ?, ?, ?, ?)", args: [id, r.lead_id, r.body, r.status ?? "draft", r.attachments && r.attachments.length ? JSON.stringify(r.attachments) : null] },
       { sql: "INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'whatsapp', ?, ?, ?, ?)", args: [crypto.randomUUID(), r.lead_id, r.status ?? "draft", r.body.slice(0, 120), id, now] },
     ];
   });
   if (statements.length) await db.batch(statements, "write"); // atomic insert
-  return c.json({ success: true });
+  return c.json({ success: true, items });
 });
 
 router.post("/whatsapps/status", async (c) => {
@@ -234,19 +286,21 @@ router.post("/whatsapps/status", async (c) => {
   const w = (await db.execute({ sql: "SELECT lead_id FROM whatsapp_messages WHERE id = ?", args: [d.id] })).rows[0] as unknown as { lead_id: string | null } | undefined;
   await insertEvent(db, { lead_id: w?.lead_id ?? null, channel: "whatsapp", action: d.status, source_ref: d.id });
   return c.json({ success: true });
-});
-
-// Actually send a WhatsApp message through the provider. Accepts an existing
+});// Actually send a WhatsApp message through the provider. Accepts an existing
 // draft `id`, or a raw `{ lead_id, body }` (convenience for a single send).
+// Text goes out first; any attachments are then sent as media via RelayX.
 router.post("/whatsapps/send", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
-  const d = z.object({ id: z.string().optional(), lead_id: z.string().optional(), body: z.string().optional() }).parse(await c.req.json());
+  const d = z
+    .object({ id: z.string().optional(), lead_id: z.string().optional(), body: z.string().optional(), attachments: attachmentSchema })
+    .parse(await c.req.json());
   const db = await getDb();
 
   let messageId = d.id ?? "";
   let leadId: string | null = d.lead_id ?? null;
   let body = d.body ?? "";
   let fromNumber: string | null = null;
+  let attachments: { filename: string; contentType: string; data: string }[] = [];
 
   if (!messageId && (leadId && body)) {
     // One-off send: create the outbound row first.
@@ -254,21 +308,23 @@ router.post("/whatsapps/send", async (c) => {
     const newId = crypto.randomUUID();
     const lead = (await db.execute({ sql: "SELECT phone FROM leads WHERE id = ?", args: [leadId] })).rows[0] as unknown as { phone: string | null } | undefined;
     if (!lead?.phone) return c.json({ error: "Lead has no phone number — add one before sending" }, 400);
+    attachments = d.attachments ?? [];
     await db.execute({
-      sql: "INSERT INTO whatsapp_messages (id, lead_id, body, direction, from_number, to_number, status) VALUES (?, ?, ?, 'outbound', ?, ?, 'draft')",
-      args: [newId, leadId, body, cfg.fromNumber || null, lead.phone],
+      sql: "INSERT INTO whatsapp_messages (id, lead_id, body, direction, from_number, to_number, status, attachments) VALUES (?, ?, ?, 'outbound', ?, ?, 'draft', ?)",
+      args: [newId, leadId, body, cfg.fromNumber || null, lead.phone, attachments.length ? JSON.stringify(attachments) : null],
     });
     messageId = newId;
     fromNumber = cfg.fromNumber || null;
   } else if (messageId) {
-    // Existing row — read it back for the lead + body + sending number.
+    // Existing row — read it back for the lead + body + sending number + files.
     const row = (await db.execute({ sql: "SELECT * FROM whatsapp_messages WHERE id = ?", args: [messageId] })).rows[0] as unknown as
-      | { lead_id: string | null; body: string; from_number: string | null }
+      | { lead_id: string | null; body: string; from_number: string | null; attachments: string | null }
       | undefined;
     if (!row) return c.json({ error: "WhatsApp message not found" }, 404);
     leadId = row.lead_id;
     body = row.body;
     fromNumber = row.from_number ?? whatsappConfig().fromNumber ?? null;
+    attachments = parseAttachments(row.attachments);
   }
 
   if (!leadId) return c.json({ error: "Message is not linked to a lead" }, 400);
@@ -286,6 +342,18 @@ router.post("/whatsapps/send", async (c) => {
   }
   if (!send.ok) return c.json({ error: send.error ?? "WhatsApp send failed" }, 502);
 
+  // Attachments: media send is best-effort — if the bridge lacks the endpoint
+  // the text still went out, and the caller is told which files failed.
+  const attachmentErrors: string[] = [];
+  for (const a of attachments) {
+    try {
+      const media = await sendMedia(lead.phone, { base64: a.data, mimetype: a.contentType, filename: a.filename });
+      if (!media.ok) attachmentErrors.push(`${a.filename}: ${media.error ?? "failed"}`);
+    } catch (e) {
+      attachmentErrors.push(`${a.filename}: ${(e as Error).message}`);
+    }
+  }
+
   const now = new Date().toISOString();
   await db.execute({
     sql: "UPDATE whatsapp_messages SET status = 'sent', sent_at = ?, provider_message_id = ?, to_number = ?, from_number = ?, direction = 'outbound' WHERE id = ?",
@@ -302,11 +370,15 @@ router.post("/whatsapps/send", async (c) => {
     summary: body.slice(0, 120),
     content: body,
     source_ref: messageId,
-    metadata: { to: lead.phone, provider_message_id: send.providerMessageId, from: fromNumber },
+    metadata: { to: lead.phone, provider_message_id: send.providerMessageId, from: fromNumber, attachments: attachments.length },
     created_at: now,
   });
   const updated = (await db.execute({ sql: "SELECT * FROM whatsapp_messages WHERE id = ?", args: [messageId] })).rows[0];
+  if (attachmentErrors.length) {
+    return c.json({ ...(updated as object), warning: `Text sent, but ${attachmentErrors.length} attachment${attachmentErrors.length === 1 ? "" : "s"} failed: ${attachmentErrors.join("; ")}` });
+  }
   return c.json(updated);
+
 });
 
 // ---- Calls ----

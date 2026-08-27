@@ -48,8 +48,21 @@ export interface SentMessage {
   thread_id: string | null;
 }
 
+/** One file attached to an outbound email (nodemailer attachment shape). */
+export interface MailAttachment {
+  filename: string;
+  contentType?: string;
+  content: Buffer;
+}
+
 /** Send an email from the configured Gmail account. */
-export async function sendMessage(args: { to: string; subject: string; text: string; html?: string }): Promise<SentMessage> {
+export async function sendMessage(args: {
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+  attachments?: MailAttachment[];
+}): Promise<SentMessage> {
   const { user } = mailerConfig();
   const info = await getTransporter().sendMail({
     from: user,
@@ -57,6 +70,7 @@ export async function sendMessage(args: { to: string; subject: string; text: str
     subject: args.subject,
     text: args.text,
     ...(args.html ? { html: args.html } : {}),
+    ...(args.attachments && args.attachments.length ? { attachments: args.attachments } : {}),
   });
   // Gmail SMTP doesn't return a thread id at send time (that's an IMAP/Gmail
   // API concept) — messageId is what we have to key off for dedupe on sync.

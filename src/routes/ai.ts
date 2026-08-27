@@ -75,6 +75,33 @@ router.post("/call", async (c) => {
   try { return c.json(JSON.parse(text.replace(/```json|```/g, "").trim())); } catch { return c.json({ suggested_outcome: "callback", book_appointment: false, summary: text, mock_transcript: [] }); }
 });
 
+router.post("/post", async (c) => {
+  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const { topic, platform, audience, tone } = z
+    .object({ topic: z.string().min(1), platform: z.string().optional(), audience: z.string().optional(), tone: z.string().optional() })
+    .parse(await c.req.json());
+  const ai = gateway();
+  const { text } = await generateText({
+    model: ai(MODEL),
+    system:
+      "You are a social media copywriter. Return strict JSON: {\"caption\":\"...\",\"hashtags\":[\"#tag\",\"#tag\"],\"image_prompt\":\"...\"}. " +
+      "The caption must be ready to post: 1-3 short paragraphs, 1-2 emojis, natural line breaks, tailored to the platform and audience. " +
+      "Hashtags: exactly 5-8 relevant tags as an array of strings including the #. " +
+      "image_prompt: a detailed English visual prompt (150-220 words) describing a striking, on-brand image for this post — subject, composition, lighting, colors, mood, and any text/graphic elements.",
+    prompt: `Topic: ${topic}\nPlatform: ${platform ?? "Instagram"}\nTarget audience: ${audience || "general"}\nTone: ${tone || "energetic and inspiring"}`,
+  });
+  try {
+    const j = JSON.parse(text.replace(/```json|```/g, "").trim());
+    return c.json({
+      caption: j.caption ?? "",
+      hashtags: Array.isArray(j.hashtags) ? j.hashtags.map(String) : [],
+      image_prompt: j.image_prompt ?? topic,
+    });
+  } catch {
+    return c.json({ caption: text, hashtags: [], image_prompt: topic });
+  }
+});
+
 router.post("/image", async (c) => {
   if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
   const { prompt, size } = z.object({ prompt: z.string(), size: z.string().optional() }).parse(await c.req.json());

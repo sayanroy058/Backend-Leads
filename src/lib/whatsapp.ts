@@ -307,6 +307,60 @@ export async function sendText(to: string, text: string): Promise<SendResult> {
   return { ok: true, providerMessageId };
 }
 
+/**
+ * Send a media file (attachment) to `to` (E.164) via RelayX.
+ * Contract: POST {base}/api/sendMedia with X-Api-Key header and body
+ * { session, chatId, base64, mimetype, filename, caption } — the same shape
+ * the common whatsapp-web.js REST wrappers accept. Not every RelayX instance
+ * exposes this endpoint, so callers treat a failure as non-fatal (text still
+ * goes out; the attachment error is surfaced as a warning).
+ */
+export async function sendMedia(
+  to: string,
+  file: { base64: string; mimetype: string; filename: string; caption?: string }
+): Promise<SendResult> {
+  const cfg = whatsappConfig();
+  if (!cfg.enabled) return { ok: false, providerMessageId: null, error: "WhatsApp provider is not configured (RELAYX_API_KEY)" };
+  if (!cfg.base) return { ok: false, providerMessageId: null, error: "RELAYX_BASE_URL is not set" };
+
+  const chatId = `${normalizePhone(to)}@c.us`;
+  const url = `${cfg.base}/api/sendMedia`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Api-Key": cfg.apiKey,
+      },
+      body: JSON.stringify({
+        session: cfg.session,
+        chatId,
+        base64: file.base64,
+        mimetype: file.mimetype,
+        filename: file.filename,
+        ...(file.caption ? { caption: file.caption } : {}),
+      }),
+    });
+  } catch (e) {
+    return { ok: false, providerMessageId: null, error: `WhatsApp provider unreachable: ${(e as Error).message}` };
+  }
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    return { ok: false, providerMessageId: null, error: `Media send failed (${res.status}): ${detail.slice(0, 300)}` };
+  }
+
+  const json = (await res.json().catch(() => ({}))) as any;
+  const providerMessageId =
+    (json?.message?.id as string | undefined) ??
+    (json?.messages?.[0]?.id as string | undefined) ??
+    (json?.id as string | undefined) ??
+    null;
+  return { ok: true, providerMessageId };
+}
+
 // ---------------------------------------------------------------------------
 // Working hours & auto-acknowledgement
 // ---------------------------------------------------------------------------

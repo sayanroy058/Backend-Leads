@@ -169,6 +169,13 @@ const WHATSAPP_MESSAGE_MIGRATIONS = [
   `ALTER TABLE whatsapp_messages ADD COLUMN acknowledged_at TEXT`,
 ];
 
+// Phase 3 — file attachments (JSON array of { filename, contentType, data(base64) })
+// on outbound email + WhatsApp messages. Sent through Gmail SMTP / RelayX media.
+const ATTACHMENT_MIGRATIONS = [
+  `ALTER TABLE email_messages ADD COLUMN attachments TEXT`,
+  `ALTER TABLE whatsapp_messages ADD COLUMN attachments TEXT`,
+];
+
 // Hardcoded demo account so login works out of the box.
 //   email:    testuser@gmail.com
 //   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
@@ -192,7 +199,7 @@ async function initDb(c: Client) {
 
   // Column migrations run individually — ALTER TABLE cannot be batched with
   // a guaranteed outcome, and duplicate-column errors are expected once applied.
-  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS]) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
