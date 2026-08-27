@@ -34,6 +34,12 @@ app.route("/api/webhooks/whatsapp", whatsappWebhookRoutes); // public — Meta/b
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 
+// Log unhandled errors server-side; keep the client response generic.
+app.onError((err, c) => {
+  console.error("[onError]", err);
+  return c.json({ error: "Internal Server Error" }, 500);
+});
+
 export default app;
 
 // Local dev only. On Vercel the app is served as a serverless function via

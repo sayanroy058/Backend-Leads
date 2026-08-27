@@ -42,12 +42,18 @@ const TABLE_DDL = [
     phone TEXT,
     company TEXT,
     source TEXT,
-    status TEXT DEFAULT 'new' CHECK(status IN ('new','contacted','qualified','booked','lost')),
+    status TEXT DEFAULT 'new' CHECK(status IN ('new','contacted','qualified','viewing','offer','closed','lost')),
     score INTEGER DEFAULT 0,
     value REAL,
     city TEXT,
     notes TEXT,
     last_activity TEXT,
+    property_interest TEXT,
+    property_type TEXT,
+    budget_min REAL,
+    budget_max REAL,
+    area TEXT,
+    urgency TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS email_messages (
@@ -229,8 +235,63 @@ async function initDb(c: Client) {
     FROM call_logs
   `);
 
+  // Real-estate specialization: widen the leads schema to real-estate stages
+  // (new → contacted → qualified → viewing → offer → closed → lost) and add
+  // property fields. SQLite cannot ALTER a CHECK constraint, so this rebuilds
+  // the table exactly once; 'booked' rows map to 'viewing'.
+  await migrateLeadsToRealEstate(c);
+
   // Phase 0 — unify onto the Conversation/Event model (idempotent).
   await migrateEventsToConversations(c);
+}
+
+/**
+ * Guarded one-time rebuild of `leads` onto the real-estate schema:
+ *   - stages: new / contacted / qualified / viewing / offer / closed / lost
+ *   - new columns: property_interest, property_type, budget_min, budget_max,
+ *     area, urgency
+ * Existing 'booked' rows become 'viewing'. Idempotent: skipped once the
+ * current schema already contains the 'viewing' stage.
+ */
+async function migrateLeadsToRealEstate(c: Client) {
+  const r = await c.execute(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leads'`);
+  const sql = (r.rows[0] as { sql?: string } | undefined)?.sql ?? "";
+  if (sql.includes("'viewing'")) return; // already migrated
+  await c.batch(
+    [
+      `CREATE TABLE leads_re (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT,
+        phone TEXT,
+        company TEXT,
+        source TEXT,
+        status TEXT DEFAULT 'new' CHECK(status IN ('new','contacted','qualified','viewing','offer','closed','lost')),
+        score INTEGER DEFAULT 0,
+        value REAL,
+        city TEXT,
+        notes TEXT,
+        last_activity TEXT,
+        property_interest TEXT,
+        property_type TEXT,
+        budget_min REAL,
+        budget_max REAL,
+        area TEXT,
+        urgency TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )`,
+      `INSERT INTO leads_re (id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at)
+         SELECT id, name, email, phone, company, source,
+                CASE WHEN status = 'booked' THEN 'viewing' ELSE status END,
+                score, value, city, notes, last_activity, created_at
+         FROM leads`,
+      `DROP TABLE leads`,
+      `ALTER TABLE leads_re RENAME TO leads`,
+      `CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email)`,
+      `CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone)`,
+    ],
+    "write"
+  );
 }
 
 /**
