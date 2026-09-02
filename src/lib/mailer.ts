@@ -124,11 +124,12 @@ async function withImap<T>(fn: (client: ImapFlow) => Promise<T>, cfg: MailerConf
 }
 
 /**
- * List the most recent messages across INBOX and Sent (newest first),
- * mirroring the old AgentMail listMessages() shape closely enough for the
- * sync route to consume unchanged. Bodies are included directly — Gmail IMAP
- * has no cheaper "metadata-only" list the way AgentMail's REST API did, so
- * getMessage() below just re-fetches the same message by uid.
+ * List the most recent messages across INBOX and Sent (newest first) using
+ * only the IMAP envelope — no body download, no mailparser pass. This is
+ * what makes listing cheap: envelope is metadata the server already has
+ * indexed, versus `source` which downloads and parses the full raw message.
+ * Callers that need the body (sync, for messages not yet stored) should
+ * fetch it separately via getMessage() for just that one message.
  */
 export async function listMessages(
   args: { limit?: number } = {},
@@ -150,10 +151,8 @@ export async function listMessages(
         const total = box.exists;
         if (!total) continue;
         const from = Math.max(1, total - limit + 1);
-        for await (const msg of client.fetch(`${from}:${total}`, { envelope: true, source: true, uid: true })) {
-          if (!msg.source) continue;
-          const parsed = await simpleParser(msg.source);
-          out.push(toFetchedMessage(parsed, msg.uid, mailbox, cfg.user));
+        for await (const msg of client.fetch(`${from}:${total}`, { envelope: true, uid: true })) {
+          out.push(toEnvelopeMessage(msg.envelope, msg.uid, mailbox, cfg.user));
         }
       } finally {
         lock.release();
@@ -186,6 +185,27 @@ export async function getMessage(messageId: string, cfg: MailerConfig = mailerCo
       lock.release();
     }
   }, cfg);
+}
+
+/** Build a listing-only FetchedMessage straight from the IMAP envelope — no
+ * body fields (text/html/extracted_*) since those require a full fetch. */
+function toEnvelopeMessage(envelope: import("imapflow").MessageEnvelopeObject | undefined, uid: number, mailbox: string, account: string): FetchedMessage {
+  const isSent = mailbox.toLowerCase().includes("sent");
+  const addr = (list?: { name?: string; address?: string }[]) =>
+    list && list.length ? list.map((a) => (a.name ? `${a.name} <${a.address}>` : a.address)).join(", ") : null;
+  return {
+    message_id: `${account}:${mailbox}:${uid}`,
+    thread_id: null,
+    from: addr(envelope?.from),
+    to: addr(envelope?.to),
+    subject: envelope?.subject ?? null,
+    text: null,
+    html: null,
+    extracted_text: null,
+    extracted_html: null,
+    timestamp: envelope?.date ? envelope.date.toISOString() : null,
+    labels: isSent ? ["sent"] : [],
+  };
 }
 
 function toFetchedMessage(parsed: Awaited<ReturnType<typeof simpleParser>>, uid: number, mailbox: string, account: string): FetchedMessage {
