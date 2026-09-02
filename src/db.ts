@@ -29,6 +29,8 @@ const TABLE_DDL = [
     password_hash TEXT NOT NULL,
     is_admin INTEGER NOT NULL DEFAULT 0,
     disabled INTEGER NOT NULL DEFAULT 0,
+    gmail_email TEXT,
+    gmail_app_password TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS sessions (
@@ -39,6 +41,7 @@ const TABLE_DDL = [
   )`,
   `CREATE TABLE IF NOT EXISTS leads (
     id TEXT PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     email TEXT,
     phone TEXT,
@@ -111,6 +114,7 @@ const TABLE_DDL = [
   )`,
   `CREATE TABLE IF NOT EXISTS chat_messages (
     id TEXT PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     role TEXT NOT NULL CHECK(role IN ('user','assistant')),
     content TEXT NOT NULL,
     citations TEXT,
@@ -190,6 +194,18 @@ const USER_ACCESS_MIGRATIONS = [
   `ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`,
 ];
 
+// Multi-tenancy — each user only sees their own leads (and, transitively,
+// their own emails/whatsapp/calls/conversations/events, all keyed off
+// leads.user_id). chat_messages is scoped directly since it has no lead.
+// Per-user Gmail sending credentials, set by an admin (falls back to the
+// GMAIL_USER/GMAIL_APP_PASSWORD env vars when unset, e.g. for the demo user).
+const TENANCY_MIGRATIONS = [
+  `ALTER TABLE leads ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE`,
+  `ALTER TABLE chat_messages ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE`,
+  `ALTER TABLE users ADD COLUMN gmail_email TEXT`,
+  `ALTER TABLE users ADD COLUMN gmail_app_password TEXT`,
+];
+
 // Hardcoded demo account so login works out of the box.
 //   email:    testuser@gmail.com
 //   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
@@ -213,7 +229,7 @@ async function initDb(c: Client) {
 
   // Column migrations run individually — ALTER TABLE cannot be batched with
   // a guaranteed outcome, and duplicate-column errors are expected once applied.
-  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS]) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
@@ -223,6 +239,12 @@ async function initDb(c: Client) {
 
   // Make the demo/first user an admin so the admin panel is reachable out of the box.
   await c.execute(`UPDATE users SET is_admin = 1 WHERE id = 1`);
+
+  // Backfill: any lead/chat_message created before per-user ownership existed
+  // (user_id IS NULL) is assigned to the demo/first user so existing data
+  // isn't orphaned or invisible after this migration.
+  await c.execute(`UPDATE leads SET user_id = 1 WHERE user_id IS NULL`);
+  await c.execute(`UPDATE chat_messages SET user_id = 1 WHERE user_id IS NULL`);
 
   // Backfill events from pre-existing channel rows so the activity feed has
   // history. Idempotent: INSERT OR IGNORE + unique (channel, source_ref).

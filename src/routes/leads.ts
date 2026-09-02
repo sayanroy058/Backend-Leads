@@ -9,7 +9,9 @@ const router = new Hono();
 router.get("/", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
-  const rows = (await (await getDb()).execute("SELECT * FROM leads ORDER BY created_at DESC")).rows;
+  const rows = (
+    await (await getDb()).execute({ sql: "SELECT * FROM leads WHERE user_id = ? ORDER BY created_at DESC", args: [user.id] })
+  ).rows;
   return c.json(rows);
 });
 
@@ -84,8 +86,8 @@ router.post("/bulk", async (c) => {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     statements.push({
-      sql: "INSERT OR REPLACE INTO leads (id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at, property_interest, property_type, budget_min, budget_max, area, urgency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      args: [id, r.name, r.email ?? null, r.phone ?? null, r.company ?? null, r.source ?? "import", r.status ?? "new", computeLeadScore(r), r.value ?? null, r.city ?? null, r.notes ?? null, now, now, r.property_interest ?? null, r.property_type ?? null, r.budget_min ?? null, r.budget_max ?? null, r.area ?? null, r.urgency ?? null],
+      sql: "INSERT OR REPLACE INTO leads (id, user_id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at, property_interest, property_type, budget_min, budget_max, area, urgency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      args: [id, user.id, r.name, r.email ?? null, r.phone ?? null, r.company ?? null, r.source ?? "import", r.status ?? "new", computeLeadScore(r), r.value ?? null, r.city ?? null, r.notes ?? null, now, now, r.property_interest ?? null, r.property_type ?? null, r.budget_min ?? null, r.budget_max ?? null, r.area ?? null, r.urgency ?? null],
     });
     inserted.push({ ...r, id, status: r.status ?? "new", score: computeLeadScore(r), last_activity: now, created_at: now });
   }
@@ -98,8 +100,8 @@ router.post("/status", async (c) => {
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const { id, status } = z.object({ id: z.string(), status: z.enum(LEAD_STATUSES) }).parse(await c.req.json());
   await (await getDb()).execute({
-    sql: "UPDATE leads SET status = ?, last_activity = ? WHERE id = ?",
-    args: [status, new Date().toISOString(), id],
+    sql: "UPDATE leads SET status = ?, last_activity = ? WHERE id = ? AND user_id = ?",
+    args: [status, new Date().toISOString(), id, user.id],
   });
   return c.json({ success: true });
 });
@@ -108,11 +110,14 @@ router.get("/activity/counts", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const rows = (
-    await (await getDb()).execute(`SELECT
-      (SELECT COUNT(*) FROM email_messages) AS emails,
-      (SELECT COUNT(*) FROM whatsapp_messages) AS whatsapps,
-      (SELECT COUNT(*) FROM call_logs) AS calls,
-      (SELECT COUNT(*) FROM appointments) AS appts`)
+    await (await getDb()).execute({
+      sql: `SELECT
+      (SELECT COUNT(*) FROM email_messages m JOIN leads l ON l.id = m.lead_id WHERE l.user_id = ?) AS emails,
+      (SELECT COUNT(*) FROM whatsapp_messages m JOIN leads l ON l.id = m.lead_id WHERE l.user_id = ?) AS whatsapps,
+      (SELECT COUNT(*) FROM call_logs m JOIN leads l ON l.id = m.lead_id WHERE l.user_id = ?) AS calls,
+      (SELECT COUNT(*) FROM appointments m JOIN leads l ON l.id = m.lead_id WHERE l.user_id = ?) AS appts`,
+      args: [user.id, user.id, user.id, user.id],
+    })
   ).rows;
   const row = rows[0] as unknown as { emails: number; whatsapps: number; calls: number; appts: number };
   return c.json({ emails: row.emails, whatsapps: row.whatsapps, calls: row.calls, appts: row.appts });
@@ -122,7 +127,13 @@ router.get("/activity/feed", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const db = await getDb();
-  const rows = (await db.execute("SELECT id, type, channel, direction, action, summary, content, created_at FROM events WHERE channel IN ('email','whatsapp','call') ORDER BY created_at DESC LIMIT 20")).rows as unknown as {
+  const rows = (await db.execute({
+    sql: `SELECT e.id, e.type, e.channel, e.direction, e.action, e.summary, e.content, e.created_at
+          FROM events e JOIN leads l ON l.id = e.lead_id
+          WHERE e.channel IN ('email','whatsapp','call') AND l.user_id = ?
+          ORDER BY e.created_at DESC LIMIT 20`,
+    args: [user.id],
+  })).rows as unknown as {
     id: string;
     type: string | null;
     channel: string;
@@ -151,18 +162,20 @@ router.get("/activity/feed", async (c) => {
 });
 
 router.get("/:id", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
-  const row = (await (await getDb()).execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [c.req.param("id")] })).rows[0];
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const row = (await (await getDb()).execute({ sql: "SELECT * FROM leads WHERE id = ? AND user_id = ?", args: [c.req.param("id"), user.id] })).rows[0];
   if (!row) return c.json({ error: "Lead not found" }, 404);
   return c.json(row);
 });
 
 router.put("/:id", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const id = c.req.param("id");
   const data = updateLeadSchema.parse(await c.req.json());
   const db = await getDb();
-  const existing = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0] as Record<string, unknown> | undefined;
+  const existing = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ? AND user_id = ?", args: [id, user.id] })).rows[0] as Record<string, unknown> | undefined;
   if (!existing) return c.json({ error: "Lead not found" }, 404);
   const score = computeLeadScore({ ...existing, ...data });
   const sets: string[] = [];
@@ -176,24 +189,26 @@ router.put("/:id", async (c) => {
   vals.push(score);
   sets.push("last_activity = ?");
   vals.push(new Date().toISOString());
-  vals.push(id);
-  await db.execute({ sql: `UPDATE leads SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  vals.push(id, user.id);
+  await db.execute({ sql: `UPDATE leads SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`, args: vals });
   const row = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0];
   return c.json(row);
 });
 
 router.delete("/:id", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const id = c.req.param("id");
-  await (await getDb()).execute({ sql: "DELETE FROM leads WHERE id = ?", args: [id] });
+  await (await getDb()).execute({ sql: "DELETE FROM leads WHERE id = ? AND user_id = ?", args: [id, user.id] });
   return c.json({ success: true });
 });
 
 router.post("/bulk-delete", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const { ids } = z.object({ ids: z.array(z.string()).min(1) }).parse(await c.req.json());
   const db = await getDb();
-  const statements: InStatement[] = ids.map((id) => ({ sql: "DELETE FROM leads WHERE id = ?", args: [id] }));
+  const statements: InStatement[] = ids.map((id) => ({ sql: "DELETE FROM leads WHERE id = ? AND user_id = ?", args: [id, user.id] }));
   await db.batch(statements, "write"); // atomic bulk delete
   return c.json({ success: true, deleted: ids.length });
 });

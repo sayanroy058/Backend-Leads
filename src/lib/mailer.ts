@@ -15,7 +15,17 @@ import nodemailer from "nodemailer";
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 
-export function mailerConfig(): { user: string; appPassword: string; imapHost: string; smtpHost: string } {
+export interface MailerConfig {
+  user: string;
+  appPassword: string;
+  imapHost: string;
+  smtpHost: string;
+}
+
+/** Falls back to the global GMAIL_USER/GMAIL_APP_PASSWORD env vars — used only
+ * when no per-user config is supplied (e.g. scripts, or before multi-tenant
+ * routing was added). Routes should pass each user's own config instead. */
+export function mailerConfig(): MailerConfig {
   const user = process.env.GMAIL_USER;
   const appPassword = process.env.GMAIL_APP_PASSWORD;
   if (!user || !appPassword) {
@@ -29,18 +39,22 @@ export function mailerConfig(): { user: string; appPassword: string; imapHost: s
   };
 }
 
-let transporter: ReturnType<typeof nodemailer.createTransport> | undefined;
-function getTransporter() {
-  if (!transporter) {
-    const { user, appPassword, smtpHost } = mailerConfig();
-    transporter = nodemailer.createTransport({
-      host: smtpHost,
+// One transporter per Gmail account (multi-tenant — each user sends from
+// their own inbox), keyed by address. Small map, never evicted; the process
+// only lives for the duration of a serverless invocation anyway.
+const transporters = new Map<string, ReturnType<typeof nodemailer.createTransport>>();
+function getTransporter(cfg: MailerConfig) {
+  let t = transporters.get(cfg.user);
+  if (!t) {
+    t = nodemailer.createTransport({
+      host: cfg.smtpHost,
       port: 465,
       secure: true,
-      auth: { user, pass: appPassword },
+      auth: { user: cfg.user, pass: cfg.appPassword },
     });
+    transporters.set(cfg.user, t);
   }
-  return transporter;
+  return t;
 }
 
 export interface SentMessage {
@@ -55,17 +69,19 @@ export interface MailAttachment {
   content: Buffer;
 }
 
-/** Send an email from the configured Gmail account. */
-export async function sendMessage(args: {
-  to: string;
-  subject: string;
-  text: string;
-  html?: string;
-  attachments?: MailAttachment[];
-}): Promise<SentMessage> {
-  const { user } = mailerConfig();
-  const info = await getTransporter().sendMail({
-    from: user,
+/** Send an email from the given (or global default) Gmail account. */
+export async function sendMessage(
+  args: {
+    to: string;
+    subject: string;
+    text: string;
+    html?: string;
+    attachments?: MailAttachment[];
+  },
+  cfg: MailerConfig = mailerConfig()
+): Promise<SentMessage> {
+  const info = await getTransporter(cfg).sendMail({
+    from: cfg.user,
     to: args.to,
     subject: args.subject,
     text: args.text,
@@ -91,13 +107,12 @@ export interface FetchedMessage {
   labels: string[];
 }
 
-async function withImap<T>(fn: (client: ImapFlow) => Promise<T>): Promise<T> {
-  const { user, appPassword, imapHost } = mailerConfig();
+async function withImap<T>(fn: (client: ImapFlow) => Promise<T>, cfg: MailerConfig = mailerConfig()): Promise<T> {
   const client = new ImapFlow({
-    host: imapHost,
+    host: cfg.imapHost,
     port: 993,
     secure: true,
-    auth: { user, pass: appPassword },
+    auth: { user: cfg.user, pass: cfg.appPassword },
     logger: false,
   });
   await client.connect();
@@ -115,7 +130,10 @@ async function withImap<T>(fn: (client: ImapFlow) => Promise<T>): Promise<T> {
  * has no cheaper "metadata-only" list the way AgentMail's REST API did, so
  * getMessage() below just re-fetches the same message by uid.
  */
-export async function listMessages(args: { limit?: number } = {}): Promise<{ messages: FetchedMessage[] }> {
+export async function listMessages(
+  args: { limit?: number } = {},
+  cfg: MailerConfig = mailerConfig()
+): Promise<{ messages: FetchedMessage[] }> {
   const limit = args.limit ?? 50;
   const messages = await withImap(async (client) => {
     const out: FetchedMessage[] = [];
@@ -143,12 +161,12 @@ export async function listMessages(args: { limit?: number } = {}): Promise<{ mes
     }
     out.sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? ""));
     return out.slice(0, limit);
-  });
+  }, cfg);
   return { messages };
 }
 
 /** Fetch one full message by its message_id (as returned from listMessages). */
-export async function getMessage(messageId: string): Promise<FetchedMessage> {
+export async function getMessage(messageId: string, cfg: MailerConfig = mailerConfig()): Promise<FetchedMessage> {
   const [mailbox, uidStr] = messageId.split(":");
   const uid = Number(uidStr);
   return withImap(async (client) => {
@@ -163,7 +181,7 @@ export async function getMessage(messageId: string): Promise<FetchedMessage> {
     } finally {
       lock.release();
     }
-  });
+  }, cfg);
 }
 
 function toFetchedMessage(parsed: Awaited<ReturnType<typeof simpleParser>>, uid: number, mailbox: string): FetchedMessage {

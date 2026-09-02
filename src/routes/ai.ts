@@ -1,12 +1,32 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import type { Client } from "@libsql/client";
 import { authenticate } from "../middleware/auth";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, tool, isStepCount } from "ai";
 import { getDb } from "../db";
-import { sendMessage } from "../lib/mailer";
+import { sendMessage, type MailerConfig } from "../lib/mailer";
 import { sendText } from "../lib/whatsapp";
 import { insertEvent } from "../lib/events";
+
+/** This user's own Gmail credentials (set by an admin), falling back to the
+ * global env vars for accounts with none configured. */
+async function userMailerConfig(db: Client, userId: number): Promise<MailerConfig> {
+  const row = (
+    await db.execute({ sql: "SELECT gmail_email, gmail_app_password FROM users WHERE id = ?", args: [userId] })
+  ).rows[0] as unknown as { gmail_email: string | null; gmail_app_password: string | null } | undefined;
+  const user = row?.gmail_email || process.env.GMAIL_USER;
+  const appPassword = row?.gmail_app_password || process.env.GMAIL_APP_PASSWORD;
+  if (!user || !appPassword) {
+    throw new Error("No email account configured for this user — ask your admin to set one in the Admin panel.");
+  }
+  return {
+    user,
+    appPassword,
+    imapHost: process.env.GMAIL_IMAP_HOST ?? "imap.gmail.com",
+    smtpHost: process.env.GMAIL_SMTP_HOST ?? "smtp.gmail.com",
+  };
+}
 
 const router = new Hono();
 
@@ -45,7 +65,10 @@ const historySchema = z.array(z.object({ role: z.enum(["user", "assistant"]), co
 // Real tools the assistant can invoke — actually send emails / WhatsApp
 // messages when the user explicitly asks. Sends are recorded in the same
 // tables the Email Studio / WhatsApp pages read, so they show up there.
-const chatTools = {
+// Built per-request so lead lookups stay scoped to the calling user — one
+// user's chat must never be able to email/WhatsApp another user's lead.
+function buildChatTools(userId: number) {
+  return {
   send_email: tool({
     description:
       "Send a real email to a lead through the connected inbox (SMTP). The email is delivered immediately and recorded in Email Studio. Call this when the user asks to send, email, or mail a lead — compose the subject and body yourself from the lead's details and requirements.",
@@ -56,22 +79,28 @@ const chatTools = {
     }),
     execute: async ({ lead_id, subject, body }) => {
       const db = await getDb();
-      const lead = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ? OR substr(id, 1, 8) = ? LIMIT 1", args: [lead_id, lead_id] })).rows[0] as unknown as
+      const lead = (await db.execute({ sql: "SELECT * FROM leads WHERE (id = ? OR substr(id, 1, 8) = ?) AND user_id = ? LIMIT 1", args: [lead_id, lead_id, userId] })).rows[0] as unknown as
         | { id: string; name: string | null; email: string | null }
         | undefined;
       if (!lead) return { ok: false, error: `No lead found with id ${lead_id}` };
       if (!lead.email) return { ok: false, error: `Lead ${lead.name ?? lead_id} has no email address on file — add one first` };
+      let mailCfg: MailerConfig;
+      try {
+        mailCfg = await userMailerConfig(db, userId);
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
       const id = crypto.randomUUID();
       await db.execute({
         sql: "INSERT INTO email_messages (id, lead_id, subject, body, direction, status, created_at) VALUES (?, ?, ?, ?, 'outbound', 'draft', ?)",
         args: [id, lead.id, subject, body, new Date().toISOString()],
       });
       try {
-        const sent = await sendMessage({ to: lead.email, subject, text: body });
+        const sent = await sendMessage({ to: lead.email, subject, text: body }, mailCfg);
         const now = new Date().toISOString();
         await db.execute({
           sql: "UPDATE email_messages SET status = 'sent', sent_at = ?, from_email = ?, to_email = ?, agentmail_message_id = ?, agentmail_thread_id = ? WHERE id = ?",
-          args: [now, process.env.GMAIL_USER ?? "", lead.email, sent.message_id ?? null, sent.thread_id ?? null, id],
+          args: [now, mailCfg.user, lead.email, sent.message_id ?? null, sent.thread_id ?? null, id],
         });
         await db.execute({ sql: "UPDATE leads SET status = 'contacted', last_activity = ? WHERE id = ?", args: [now, lead.id] });
         await insertEvent(db, {
@@ -104,7 +133,7 @@ const chatTools = {
     }),
     execute: async ({ lead_id, body }) => {
       const db = await getDb();
-      const lead = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ? OR substr(id, 1, 8) = ? LIMIT 1", args: [lead_id, lead_id] })).rows[0] as unknown as
+      const lead = (await db.execute({ sql: "SELECT * FROM leads WHERE (id = ? OR substr(id, 1, 8) = ?) AND user_id = ? LIMIT 1", args: [lead_id, lead_id, userId] })).rows[0] as unknown as
         | { id: string; name: string | null; phone: string | null }
         | undefined;
       if (!lead) return { ok: false, error: `No lead found with id ${lead_id}` };
@@ -143,10 +172,12 @@ const chatTools = {
       }
     },
   }),
-};
+  };
+}
 
 router.post("/chat", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const authedUser = await authenticate(c);
+  if (!authedUser) return c.json({ error: "Unauthorized" }, 401);
   const { question, leads, history } = z
     .object({ question: z.string(), leads: z.array(z.any()), history: historySchema.optional() })
     .parse(await c.req.json());
@@ -163,7 +194,7 @@ router.post("/chat", async (c) => {
         ...(history ?? []),
         { role: "user", content: question },
       ],
-      tools: chatTools,
+      tools: buildChatTools(authedUser.id),
       stopWhen: isStepCount(5),
       // The gateway rejects function tools combined with reasoning_effort on
       // this model (/v1/chat/completions) — explicitly disable reasoning so

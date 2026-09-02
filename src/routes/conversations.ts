@@ -20,19 +20,24 @@ function enrichSla(conv: any) {
 }
 
 router.get("/", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const status = c.req.query("status");
   const sla = c.req.query("sla");
   const db = await getDb();
-  let rows = (await db.execute(`
+  let rows = (await db.execute({
+    sql: `
     SELECT c.id, c.lead_id, c.status, c.sla_due_at, c.sla_status,
            c.first_event_at, c.last_event_at, c.created_at,
            l.name AS lead_name, l.company, l.city, l.phone, l.email, l.source,
            (SELECT content FROM events e WHERE e.conversation_id = c.id ORDER BY e.created_at DESC LIMIT 1) AS last_content,
            (SELECT created_at FROM events e WHERE e.conversation_id = c.id ORDER BY e.created_at DESC LIMIT 1) AS last_event_created
     FROM conversations c JOIN leads l ON l.id = c.lead_id
+    WHERE l.user_id = ?
     ORDER BY COALESCE(c.last_event_at, c.created_at) DESC
-  `)).rows as any[];
+  `,
+    args: [user.id],
+  })).rows as any[];
   rows = rows.map(enrichSla);
   if (status) rows = rows.filter((r) => r.status === status);
   if (sla) rows = rows.filter((r) => r.sla_status === sla);
@@ -40,12 +45,13 @@ router.get("/", async (c) => {
 });
 
 router.get("/:id", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const db = await getDb();
   const conv = (await db.execute({
     sql: `SELECT c.*, l.name AS lead_name, l.company, l.city, l.phone, l.email, l.source, l.status AS lead_status
-          FROM conversations c JOIN leads l ON l.id = c.lead_id WHERE c.id = ?`,
-    args: [c.req.param("id")],
+          FROM conversations c JOIN leads l ON l.id = c.lead_id WHERE c.id = ? AND l.user_id = ?`,
+    args: [c.req.param("id"), user.id],
   })).rows[0] as any;
   if (!conv) return c.json({ error: "Conversation not found" }, 404);
   const events = (await db.execute({
@@ -59,10 +65,14 @@ router.get("/:id", async (c) => {
 // Add an internal note to the thread (type 'note', direction 'internal' — does
 // NOT clear the SLA; handle via resolve or an outbound event).
 router.post("/:id/events", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const d = z.object({ content: z.string().min(1), handled_by: z.enum(["human", "ai"]).optional() }).parse(await c.req.json());
   const db = await getDb();
-  const conv = (await db.execute({ sql: "SELECT lead_id FROM conversations WHERE id = ?", args: [c.req.param("id")] })).rows[0] as unknown as { lead_id: string } | undefined;
+  const conv = (await db.execute({
+    sql: `SELECT c.lead_id FROM conversations c JOIN leads l ON l.id = c.lead_id WHERE c.id = ? AND l.user_id = ?`,
+    args: [c.req.param("id"), user.id],
+  })).rows[0] as unknown as { lead_id: string } | undefined;
   if (!conv) return c.json({ error: "Conversation not found" }, 404);
   await insertEvent(db, {
     lead_id: conv.lead_id,
@@ -80,9 +90,15 @@ router.post("/:id/events", async (c) => {
 
 // Resolve / reopen / set conversation status.
 router.post("/:id/status", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const d = z.object({ status: z.enum(["new", "active", "awaiting_reply", "resolved", "archived"]) }).parse(await c.req.json());
   const db = await getDb();
+  const conv = (await db.execute({
+    sql: `SELECT c.id FROM conversations c JOIN leads l ON l.id = c.lead_id WHERE c.id = ? AND l.user_id = ?`,
+    args: [c.req.param("id"), user.id],
+  })).rows[0];
+  if (!conv) return c.json({ error: "Conversation not found" }, 404);
   await setConversationStatus(db, c.req.param("id"), d.status as ConversationStatus);
   return c.json({ success: true });
 });
