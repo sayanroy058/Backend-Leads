@@ -53,8 +53,9 @@ router.post("/register", async (c) => {
     const userId = Number(result.lastInsertRowid);
     const token = generateToken();
     await db.execute({ sql: "INSERT INTO sessions (id, user_id) VALUES (?, ?)", args: [token, userId] });
-    const user = (await db.execute({ sql: "SELECT id, name, email FROM users WHERE id = ?", args: [userId] })).rows[0];
-    return c.json({ token, user });
+    const user = (await db.execute({ sql: "SELECT id, name, email, is_admin FROM users WHERE id = ?", args: [userId] }))
+      .rows[0] as unknown as { id: number; name: string | null; email: string; is_admin: number };
+    return c.json({ token, user: { ...user, is_admin: !!user.is_admin } });
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
@@ -66,16 +67,19 @@ router.post("/login", async (c) => {
     const db = await getDb();
     const user = (
       await db.execute({
-        sql: "SELECT id, name, email, password_hash FROM users WHERE email = ?",
+        sql: "SELECT id, name, email, password_hash, is_admin, disabled FROM users WHERE email = ?",
         args: [data.email.toLowerCase().trim()],
       })
-    ).rows[0] as unknown as { id: number; name: string | null; email: string; password_hash: string } | undefined;
+    ).rows[0] as unknown as
+      | { id: number; name: string | null; email: string; password_hash: string; is_admin: number; disabled: number }
+      | undefined;
     if (!user) return c.json({ error: "Invalid email or password" }, 401);
+    if (user.disabled) return c.json({ error: "This account has been disabled. Contact your administrator." }, 403);
     const valid = await verifyPassword(db, data.password, user.password_hash, user.id);
     if (!valid) return c.json({ error: "Invalid email or password" }, 401);
     const token = generateToken();
     await db.execute({ sql: "INSERT INTO sessions (id, user_id) VALUES (?, ?)", args: [token, user.id] });
-    return c.json({ token, user: { id: user.id, name: user.name, email: user.email } });
+    return c.json({ token, user: { id: user.id, name: user.name, email: user.email, is_admin: !!user.is_admin } });
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
@@ -93,7 +97,7 @@ router.post("/logout", async (c) => {
 router.get("/me", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ user: null });
-  return c.json({ user: { id: user.id, name: user.name, email: user.email } });
+  return c.json({ user });
 });
 
 export default router;

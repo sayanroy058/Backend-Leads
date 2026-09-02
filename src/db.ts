@@ -27,6 +27,8 @@ const TABLE_DDL = [
     name TEXT,
     email TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
+    is_admin INTEGER NOT NULL DEFAULT 0,
+    disabled INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS sessions (
@@ -182,6 +184,12 @@ const ATTACHMENT_MIGRATIONS = [
   `ALTER TABLE whatsapp_messages ADD COLUMN attachments TEXT`,
 ];
 
+// Admin panel — user access control (is_admin/disabled) for pre-existing DBs.
+const USER_ACCESS_MIGRATIONS = [
+  `ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`,
+];
+
 // Hardcoded demo account so login works out of the box.
 //   email:    testuser@gmail.com
 //   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
@@ -205,13 +213,16 @@ async function initDb(c: Client) {
 
   // Column migrations run individually — ALTER TABLE cannot be batched with
   // a guaranteed outcome, and duplicate-column errors are expected once applied.
-  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS]) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
       // column already exists — ignore
     }
   }
+
+  // Make the demo/first user an admin so the admin panel is reachable out of the box.
+  await c.execute(`UPDATE users SET is_admin = 1 WHERE id = 1`);
 
   // Backfill events from pre-existing channel rows so the activity feed has
   // history. Idempotent: INSERT OR IGNORE + unique (channel, source_ref).
