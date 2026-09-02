@@ -153,7 +153,7 @@ export async function listMessages(
         for await (const msg of client.fetch(`${from}:${total}`, { envelope: true, source: true, uid: true })) {
           if (!msg.source) continue;
           const parsed = await simpleParser(msg.source);
-          out.push(toFetchedMessage(parsed, msg.uid, mailbox));
+          out.push(toFetchedMessage(parsed, msg.uid, mailbox, cfg.user));
         }
       } finally {
         lock.release();
@@ -167,7 +167,11 @@ export async function listMessages(
 
 /** Fetch one full message by its message_id (as returned from listMessages). */
 export async function getMessage(messageId: string, cfg: MailerConfig = mailerConfig()): Promise<FetchedMessage> {
-  const [mailbox, uidStr] = messageId.split(":");
+  // messageId is "account:mailbox:uid" (see toFetchedMessage) — account is
+  // included so ids are unique across different users' Gmail accounts, but
+  // isn't needed to locate the message since cfg already picks the account.
+  const parts = messageId.split(":");
+  const [mailbox, uidStr] = parts.length >= 3 ? parts.slice(1) : parts;
   const uid = Number(uidStr);
   return withImap(async (client) => {
     const lock = await client.getMailboxLock(mailbox);
@@ -175,7 +179,7 @@ export async function getMessage(messageId: string, cfg: MailerConfig = mailerCo
       for await (const msg of client.fetch({ uid }, { source: true, uid: true }, { uid: true })) {
         if (!msg.source) continue;
         const parsed = await simpleParser(msg.source);
-        return toFetchedMessage(parsed, msg.uid, mailbox);
+        return toFetchedMessage(parsed, msg.uid, mailbox, cfg.user);
       }
       throw new Error(`Message ${messageId} not found`);
     } finally {
@@ -184,10 +188,13 @@ export async function getMessage(messageId: string, cfg: MailerConfig = mailerCo
   }, cfg);
 }
 
-function toFetchedMessage(parsed: Awaited<ReturnType<typeof simpleParser>>, uid: number, mailbox: string): FetchedMessage {
+function toFetchedMessage(parsed: Awaited<ReturnType<typeof simpleParser>>, uid: number, mailbox: string, account: string): FetchedMessage {
   const isSent = mailbox.toLowerCase().includes("sent");
   return {
-    message_id: `${mailbox}:${uid}`,
+    // Prefixed with the account so the same IMAP uid in two different users'
+    // mailboxes (both commonly start counting from 1) never collides in the
+    // agentmail_message_id dedupe check on sync.
+    message_id: `${account}:${mailbox}:${uid}`,
     thread_id: (parsed.headers.get("thread-index") as string | undefined) ?? null,
     from: parsed.from?.text ?? null,
     to: Array.isArray(parsed.to) ? parsed.to.map((t) => t.text).join(", ") : (parsed.to?.text ?? null),
